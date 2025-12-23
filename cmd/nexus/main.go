@@ -3,98 +3,126 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
+
+	"github.com/codelaboratoryltd/nexus/internal/hashring"
 )
 
 var (
-	httpPort    int
-	grpcPort    int
-	metricsPort int
-	storeType   string
-	etcdAddr    string
+	// Build info (set at compile time)
+	BuildVersion = "dev"
+	BuildCommit  = "unknown"
 )
 
+// Config holds server configuration
+type Config struct {
+	NodeID      string
+	Role        string
+	HTTPPort    int
+	MetricsPort int
+	P2PPort     int
+	DataPath    string
+	Bootstrap   []string
+}
+
 func main() {
-	rootCmd := &cobra.Command{
-		Use:   "nexus",
-		Short: "Nexus - Central coordination service for BNG edge network",
-		Long: `Nexus provides central coordination for distributed OLT-BNG deployments:
-  - Bootstrap API for OLT registration
-  - Subscriber state management (CLSet CRDT)
-  - IP allocation via consistent hashring
-  - Configuration distribution`,
-	}
-
-	serveCmd := &cobra.Command{
-		Use:   "serve",
-		Short: "Start the Nexus server",
-		RunE:  runServe,
-	}
-
-	serveCmd.Flags().IntVar(&httpPort, "http-port", 9000, "HTTP API port")
-	serveCmd.Flags().IntVar(&grpcPort, "grpc-port", 9001, "gRPC API port")
-	serveCmd.Flags().IntVar(&metricsPort, "metrics-port", 9002, "Prometheus metrics port")
-	serveCmd.Flags().StringVar(&storeType, "store", "memory", "Store type: memory, etcd")
-	serveCmd.Flags().StringVar(&etcdAddr, "etcd-addr", "localhost:2379", "etcd address")
-
-	rootCmd.AddCommand(serveCmd)
-
-	if err := rootCmd.Execute(); err != nil {
-		log.Fatal(err)
+	if err := rootCommand().Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-func runServe(cmd *cobra.Command, args []string) error {
+func rootCommand() *cobra.Command {
+	var cfg Config
+
+	root := &cobra.Command{
+		Use:   "nexus",
+		Short: "Nexus - Central coordination service for BNG edge networks",
+		Long: `Nexus provides central coordination for distributed OLT-BNG deployments:
+  - Resource management (IPs, VLANs, ports)
+  - OLT bootstrap and registration
+  - Configuration distribution
+  - Distributed state via CLSet CRDT`,
+	}
+
+	serve := &cobra.Command{
+		Use:   "serve",
+		Short: "Start the Nexus server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runServer(cfg)
+		},
+	}
+
+	serve.Flags().StringVar(&cfg.NodeID, "node-id", "", "Node identifier (auto-generated if empty)")
+	serve.Flags().StringVar(&cfg.Role, "role", "core", "Node role: core, write, read")
+	serve.Flags().IntVar(&cfg.HTTPPort, "http-port", 9000, "HTTP API port")
+	serve.Flags().IntVar(&cfg.MetricsPort, "metrics-port", 9002, "Prometheus metrics port")
+	serve.Flags().IntVar(&cfg.P2PPort, "p2p-port", 33123, "P2P listen port")
+	serve.Flags().StringVar(&cfg.DataPath, "data-path", "data", "Data directory path")
+	serve.Flags().StringSliceVar(&cfg.Bootstrap, "bootstrap", nil, "Bootstrap peer addresses")
+
+	version := &cobra.Command{
+		Use:   "version",
+		Short: "Print version information",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("Nexus %s (%s)\n", BuildVersion, BuildCommit)
+		},
+	}
+
+	root.AddCommand(serve, version)
+	return root
+}
+
+func runServer(cfg Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle shutdown signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	fmt.Printf("Starting Nexus %s (%s)\n", BuildVersion, BuildCommit)
+	fmt.Printf("  Role:     %s\n", cfg.Role)
+	fmt.Printf("  HTTP:     http://localhost:%d\n", cfg.HTTPPort)
+	fmt.Printf("  Metrics:  http://localhost:%d/metrics\n", cfg.MetricsPort)
+	fmt.Printf("  P2P:      :%d\n", cfg.P2PPort)
+
+	// Initialize hashring
+	ring := hashring.NewVirtualNodesHashRing()
+
+	// Create HTTP router
+	router := mux.NewRouter()
+
+	// Health endpoints
+	router.HandleFunc("/health", healthHandler).Methods("GET")
+	router.HandleFunc("/ready", readyHandler).Methods("GET")
+
+	// API v1 endpoints
+	api := router.PathPrefix("/api/v1").Subrouter()
+	api.HandleFunc("/pools", listPoolsHandler(ring)).Methods("GET")
+	api.HandleFunc("/pools", createPoolHandler(ring)).Methods("POST")
+	api.HandleFunc("/nodes", listNodesHandler(ring)).Methods("GET")
 
 	// Start HTTP server
-	httpMux := http.NewServeMux()
-	httpMux.HandleFunc("/health", healthHandler)
-	httpMux.HandleFunc("/ready", readyHandler)
-	httpMux.HandleFunc("/api/v1/bootstrap", bootstrapHandler)
-	httpMux.HandleFunc("/api/v1/subscribers", subscribersHandler)
-
 	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", httpPort),
-		Handler: httpMux,
+		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
+		Handler: router,
 	}
 
 	// Start metrics server
-	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsRouter := mux.NewRouter()
+	metricsRouter.Handle("/metrics", promhttp.Handler())
 	metricsServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", metricsPort),
-		Handler: metricsMux,
+		Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
+		Handler: metricsRouter,
 	}
 
-	// Start gRPC server
-	grpcListener, err := net.Listen("tcp", fmt.Sprintf(":%d", grpcPort))
-	if err != nil {
-		return fmt.Errorf("failed to listen on gRPC port: %w", err)
-	}
-
-	log.Printf("Nexus starting...")
-	log.Printf("  HTTP API:  http://localhost:%d", httpPort)
-	log.Printf("  gRPC API:  localhost:%d", grpcPort)
-	log.Printf("  Metrics:   http://localhost:%d/metrics", metricsPort)
-	log.Printf("  Store:     %s", storeType)
-
-	// Run servers
-	errCh := make(chan error, 3)
+	// Start servers in goroutines
+	errCh := make(chan error, 2)
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
@@ -108,19 +136,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	go func() {
-		// gRPC server placeholder
-		log.Printf("gRPC server listening on %s", grpcListener.Addr())
-		// TODO: Register gRPC services
-		<-ctx.Done()
-	}()
+	fmt.Println("Nexus ready!")
 
-	// Wait for shutdown or error
+	// Wait for shutdown signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
 	select {
 	case sig := <-sigCh:
-		log.Printf("Received signal %v, shutting down...", sig)
+		fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
 	case err := <-errCh:
-		log.Printf("Server error: %v", err)
+		fmt.Printf("Server error: %v\n", err)
+	case <-ctx.Done():
 	}
 
 	// Graceful shutdown
@@ -129,9 +156,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	httpServer.Shutdown(shutdownCtx)
 	metricsServer.Shutdown(shutdownCtx)
-	grpcListener.Close()
 
-	log.Printf("Nexus stopped")
+	fmt.Println("Nexus stopped")
 	return nil
 }
 
@@ -141,21 +167,33 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: Check store connectivity
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ready"))
 }
 
-func bootstrapHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement OLT bootstrap/registration
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "not_implemented"}`))
+func listPoolsHandler(ring *hashring.VirtualHashRing) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pools := ring.GetIPPools()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"pools": %d}`, len(pools))
+	}
 }
 
-func subscribersHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement subscriber CRUD
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"subscribers": []}`))
+func createPoolHandler(ring *hashring.VirtualHashRing) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// TODO: Parse request body and create pool
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		w.Write([]byte(`{"error": "not implemented"}`))
+	}
+}
+
+func listNodesHandler(ring *hashring.VirtualHashRing) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		nodes := ring.ListNodes()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"nodes": %d}`, len(nodes))
+	}
 }
