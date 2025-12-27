@@ -9,11 +9,20 @@ import (
 	"syscall"
 	"time"
 
+	badger "github.com/dgraph-io/badger/v4"
 	"github.com/gorilla/mux"
+	ds "github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
+	badgerds "github.com/ipfs/go-ds-badger4"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 
+	"github.com/codelaboratoryltd/nexus/internal/api"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
+	"github.com/codelaboratoryltd/nexus/internal/keys"
+	"github.com/codelaboratoryltd/nexus/internal/state"
+	"github.com/codelaboratoryltd/nexus/internal/store"
 )
 
 var (
@@ -31,6 +40,7 @@ type Config struct {
 	P2PPort     int
 	DataPath    string
 	Bootstrap   []string
+	P2PEnabled  bool
 }
 
 func main() {
@@ -68,6 +78,7 @@ func rootCommand() *cobra.Command {
 	serve.Flags().IntVar(&cfg.P2PPort, "p2p-port", 33123, "P2P listen port")
 	serve.Flags().StringVar(&cfg.DataPath, "data-path", "data", "Data directory path")
 	serve.Flags().StringSliceVar(&cfg.Bootstrap, "bootstrap", nil, "Bootstrap peer addresses")
+	serve.Flags().BoolVar(&cfg.P2PEnabled, "p2p", false, "Enable P2P mode with CLSet CRDT")
 
 	version := &cobra.Command{
 		Use:   "version",
@@ -89,23 +100,84 @@ func runServer(cfg Config) error {
 	fmt.Printf("  Role:     %s\n", cfg.Role)
 	fmt.Printf("  HTTP:     http://localhost:%d\n", cfg.HTTPPort)
 	fmt.Printf("  Metrics:  http://localhost:%d/metrics\n", cfg.MetricsPort)
-	fmt.Printf("  P2P:      :%d\n", cfg.P2PPort)
+	fmt.Printf("  P2P:      %v (port %d)\n", cfg.P2PEnabled, cfg.P2PPort)
 
-	// Initialize hashring
-	ring := hashring.NewVirtualNodesHashRing()
+	var (
+		ring       *hashring.VirtualHashRing
+		poolStore  store.PoolStore
+		nodeStore  store.NodeStore
+		allocStore store.AllocationStore
+	)
+
+	if cfg.P2PEnabled {
+		// P2P mode with CLSet CRDT
+		fmt.Println("  Mode:     P2P (CLSet CRDT)")
+
+		// Create data directory
+		if err := os.MkdirAll(cfg.DataPath, 0755); err != nil {
+			return fmt.Errorf("failed to create data directory: %w", err)
+		}
+
+		// Initialize badger datastore
+		opts := badger.DefaultOptions(cfg.DataPath)
+		opts.Logger = nil // Disable badger logging
+		bds, err := badgerds.NewDatastore(cfg.DataPath, &badgerds.DefaultOptions)
+		if err != nil {
+			return fmt.Errorf("failed to create badger datastore: %w", err)
+		}
+		defer bds.Close()
+
+		// Generate or load private key
+		pk, err := loadOrGenerateKey(cfg.DataPath)
+		if err != nil {
+			return fmt.Errorf("failed to load/generate key: %w", err)
+		}
+
+		// Initialize state manager with P2P
+		stateCfg := state.Config{
+			PrivateKey:     pk,
+			ListenPort:     uint32(cfg.P2PPort),
+			Role:           cfg.Role,
+			Topic:          "nexus-state",
+			Bootstrap:      cfg.Bootstrap,
+			Datastore:      bds,
+			EventQueueSize: 1000,
+		}
+
+		stateManager, err := state.NewStateManager(ctx, stateCfg)
+		if err != nil {
+			return fmt.Errorf("failed to create state manager: %w", err)
+		}
+
+		ring = stateManager.HashRing()
+		poolStore = stateManager.PoolStore()
+		nodeStore = stateManager.NodeStore()
+		allocStore = stateManager.AllocationStore()
+
+		fmt.Printf("  Peer ID:  %s\n", stateManager.ID())
+	} else {
+		// Standalone mode with in-memory datastore
+		fmt.Println("  Mode:     Standalone (in-memory)")
+
+		ring = hashring.NewVirtualNodesHashRing()
+		memDS := dssync.MutexWrap(ds.NewMapDatastore())
+
+		poolStore = store.NewPoolStore(memDS, keys.PoolKey)
+		nodeStore = store.NewNodeStore(&memoryStateStore{})
+		allocStore = store.NewAllocationStore(
+			memDS,
+			keys.AllocationKey,
+			keys.SubscriberKey,
+			poolStore,
+		)
+	}
+
+	// Create API server
+	apiServer := api.NewServer(ring, poolStore, nodeStore, allocStore)
 
 	// Create HTTP router
 	router := mux.NewRouter()
-
-	// Health endpoints
-	router.HandleFunc("/health", healthHandler).Methods("GET")
-	router.HandleFunc("/ready", readyHandler).Methods("GET")
-
-	// API v1 endpoints
-	api := router.PathPrefix("/api/v1").Subrouter()
-	api.HandleFunc("/pools", listPoolsHandler(ring)).Methods("GET")
-	api.HandleFunc("/pools", createPoolHandler(ring)).Methods("POST")
-	api.HandleFunc("/nodes", listNodesHandler(ring)).Methods("GET")
+	apiServer.RegisterRoutes(router)
 
 	// Start HTTP server
 	httpServer := &http.Server{
@@ -161,39 +233,46 @@ func runServer(cfg Config) error {
 	return nil
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
-}
+// loadOrGenerateKey loads an existing private key or generates a new one.
+func loadOrGenerateKey(dataPath string) (crypto.PrivKey, error) {
+	keyPath := dataPath + "/node.key"
 
-func readyHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ready"))
-}
-
-func listPoolsHandler(ring *hashring.VirtualHashRing) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		pools := ring.GetIPPools()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"pools": %d}`, len(pools))
+	// Try to load existing key
+	keyData, err := os.ReadFile(keyPath)
+	if err == nil {
+		pk, err := crypto.UnmarshalPrivateKey(keyData)
+		if err == nil {
+			return pk, nil
+		}
 	}
+
+	// Generate new key
+	pk, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate key pair: %w", err)
+	}
+
+	// Save key
+	keyData, err = crypto.MarshalPrivateKey(pk)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal private key: %w", err)
+	}
+
+	if err := os.WriteFile(keyPath, keyData, 0600); err != nil {
+		return nil, fmt.Errorf("failed to save private key: %w", err)
+	}
+
+	return pk, nil
 }
 
-func createPoolHandler(ring *hashring.VirtualHashRing) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// TODO: Parse request body and create pool
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotImplemented)
-		w.Write([]byte(`{"error": "not implemented"}`))
-	}
+// memoryStateStore is a simple in-memory state store for standalone mode.
+type memoryStateStore struct {
+	members map[string]*store.NodeMember
 }
 
-func listNodesHandler(ring *hashring.VirtualHashRing) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		nodes := ring.ListNodes()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"nodes": %d}`, len(nodes))
+func (m *memoryStateStore) GetMembers(ctx context.Context) map[string]*store.NodeMember {
+	if m.members == nil {
+		m.members = make(map[string]*store.NodeMember)
 	}
+	return m.members
 }

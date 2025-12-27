@@ -2,6 +2,7 @@ package hashring
 
 import (
 	"fmt"
+	"net"
 	"sync"
 )
 
@@ -313,4 +314,118 @@ func (m HashMapping) ListOwnedVirtualHashes(nodeID NodeID) map[PoolID]map[Virtua
 		return nil
 	}
 	return m.NodePoolVNode[nodeID]
+}
+
+// AddPool is a convenience wrapper for RegisterPool
+func (r *VirtualHashRing) AddPool(poolID string, network *net.IPNet) error {
+	return r.RegisterPool(IPPool{
+		ID:          PoolID(poolID),
+		Network:     network,
+		VNodesCount: DefaultVNodesCount,
+	})
+}
+
+// RemovePool is a convenience wrapper for UnregisterPool
+func (r *VirtualHashRing) RemovePool(poolID string) error {
+	return r.UnregisterPool(PoolID(poolID))
+}
+
+// AllocateIP returns an IP for a subscriber from a pool using consistent hashing.
+// The subscriber ID is hashed to deterministically select a virtual node,
+// then an IP is allocated from that node's subnet.
+func (r *VirtualHashRing) AllocateIP(poolID string, subscriberID string) net.IP {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	poolHashRing, exists := r.poolsHashRings[PoolID(poolID)]
+	if !exists {
+		return nil
+	}
+
+	// Use subscriber ID to determine which virtual node to use
+	hash := hashString(subscriberID)
+	hashOrders := poolHashRing.GetHashOrders()
+
+	if len(hashOrders) == 0 {
+		return nil
+	}
+
+	// Find the virtual node for this subscriber
+	vnodeIndex := int(hash % uint64(len(hashOrders)))
+	var selectedVNode HashID
+	i := 0
+	for vnode := range hashOrders {
+		if i == vnodeIndex {
+			selectedVNode = vnode
+			break
+		}
+		i++
+	}
+
+	// Get the subnet for this virtual node
+	subnets, err := poolHashRing.GetHashIPNets(selectedVNode)
+	if err != nil {
+		return nil
+	}
+
+	for _, subnet := range subnets {
+		// Generate a deterministic IP from the subnet based on subscriber hash
+		ip := ipFromSubnetAndHash(subnet, hash)
+		if ip != nil {
+			return ip
+		}
+	}
+
+	return nil
+}
+
+// hashString creates a hash from a string for consistent allocation
+func hashString(s string) uint64 {
+	var hash uint64 = 5381
+	for _, c := range s {
+		hash = ((hash << 5) + hash) + uint64(c)
+	}
+	return hash
+}
+
+// ipFromSubnetAndHash generates a deterministic IP within a subnet
+func ipFromSubnetAndHash(subnet *net.IPNet, hash uint64) net.IP {
+	if subnet == nil || subnet.IP == nil {
+		return nil
+	}
+
+	ones, bits := subnet.Mask.Size()
+	hostBits := bits - ones
+	if hostBits <= 0 {
+		return nil
+	}
+
+	// Calculate number of available IPs (excluding network and broadcast for IPv4)
+	maxHosts := uint64(1) << uint(hostBits)
+	if bits == 32 && hostBits > 1 { // IPv4 with room for network/broadcast
+		maxHosts -= 2 // Exclude network and broadcast
+	}
+
+	if maxHosts == 0 {
+		return nil
+	}
+
+	// Select host offset based on hash
+	hostOffset := (hash % maxHosts)
+	if bits == 32 && hostBits > 1 {
+		hostOffset++ // Skip network address
+	}
+
+	// Calculate the IP
+	ip := make(net.IP, len(subnet.IP))
+	copy(ip, subnet.IP)
+
+	// Add the offset to the IP
+	for i := len(ip) - 1; i >= 0 && hostOffset > 0; i-- {
+		sum := uint64(ip[i]) + (hostOffset & 0xFF)
+		ip[i] = byte(sum)
+		hostOffset = (hostOffset >> 8) + (sum >> 8)
+	}
+
+	return ip
 }
