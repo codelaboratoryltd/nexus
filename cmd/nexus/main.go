@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/codelaboratoryltd/nexus/internal/keys"
 	"github.com/codelaboratoryltd/nexus/internal/state"
 	"github.com/codelaboratoryltd/nexus/internal/store"
+	"github.com/codelaboratoryltd/nexus/internal/ztp"
 )
 
 var (
@@ -41,6 +44,13 @@ type Config struct {
 	DataPath    string
 	Bootstrap   []string
 	P2PEnabled  bool
+
+	// ZTP DHCP server config
+	ZTPEnabled   bool
+	ZTPInterface string
+	ZTPNetwork   string
+	ZTPGateway   string
+	ZTPDNS       string
 }
 
 func main() {
@@ -80,6 +90,13 @@ func rootCommand() *cobra.Command {
 	serve.Flags().StringSliceVar(&cfg.Bootstrap, "bootstrap", nil, "Bootstrap peer addresses")
 	serve.Flags().BoolVar(&cfg.P2PEnabled, "p2p", false, "Enable P2P mode with CLSet CRDT")
 
+	// ZTP DHCP server flags
+	serve.Flags().BoolVar(&cfg.ZTPEnabled, "ztp", false, "Enable ZTP DHCP server for OLT-BNG provisioning")
+	serve.Flags().StringVar(&cfg.ZTPInterface, "ztp-interface", "eth0", "Interface for ZTP DHCP server")
+	serve.Flags().StringVar(&cfg.ZTPNetwork, "ztp-network", "192.168.100.0/24", "Management network CIDR for OLT-BNG devices")
+	serve.Flags().StringVar(&cfg.ZTPGateway, "ztp-gateway", "", "Gateway IP for management network (defaults to first IP)")
+	serve.Flags().StringVar(&cfg.ZTPDNS, "ztp-dns", "8.8.8.8,8.8.4.4", "DNS servers (comma-separated)")
+
 	version := &cobra.Command{
 		Use:   "version",
 		Short: "Print version information",
@@ -101,6 +118,7 @@ func runServer(cfg Config) error {
 	fmt.Printf("  HTTP:     http://localhost:%d\n", cfg.HTTPPort)
 	fmt.Printf("  Metrics:  http://localhost:%d/metrics\n", cfg.MetricsPort)
 	fmt.Printf("  P2P:      %v (port %d)\n", cfg.P2PEnabled, cfg.P2PPort)
+	fmt.Printf("  ZTP:      %v\n", cfg.ZTPEnabled)
 
 	var (
 		ring       *hashring.VirtualHashRing
@@ -208,6 +226,36 @@ func runServer(cfg Config) error {
 		}
 	}()
 
+	// Start ZTP DHCP server if enabled
+	var ztpServer *ztp.Server
+	if cfg.ZTPEnabled {
+		ztpCfg, err := parseZTPConfig(cfg)
+		if err != nil {
+			return fmt.Errorf("failed to parse ZTP config: %w", err)
+		}
+
+		ztpServer, err = ztp.NewServer(ztpCfg)
+		if err != nil {
+			return fmt.Errorf("failed to create ZTP server: %w", err)
+		}
+
+		// Set up callbacks for device discovery/leasing
+		ztpServer.OnDeviceDiscovered = func(mac net.HardwareAddr, hostname, vendorInfo string) {
+			fmt.Printf("ZTP: Device discovered - MAC=%s hostname=%s vendor=%s\n", mac, hostname, vendorInfo)
+		}
+		ztpServer.OnDeviceLeased = func(mac net.HardwareAddr, ip net.IP) {
+			fmt.Printf("ZTP: Lease granted - MAC=%s IP=%s\n", mac, ip)
+			// TODO: Register device with node store
+		}
+
+		go func() {
+			fmt.Printf("  ZTP DHCP: listening on %s (%s)\n", cfg.ZTPInterface, cfg.ZTPNetwork)
+			if err := ztpServer.Start(ctx); err != nil {
+				errCh <- fmt.Errorf("ZTP server error: %w", err)
+			}
+		}()
+	}
+
 	fmt.Println("Nexus ready!")
 
 	// Wait for shutdown signal
@@ -229,8 +277,81 @@ func runServer(cfg Config) error {
 	httpServer.Shutdown(shutdownCtx)
 	metricsServer.Shutdown(shutdownCtx)
 
+	if ztpServer != nil {
+		ztpServer.Stop()
+	}
+
 	fmt.Println("Nexus stopped")
 	return nil
+}
+
+// parseZTPConfig parses ZTP configuration from flags.
+func parseZTPConfig(cfg Config) (ztp.Config, error) {
+	_, network, err := net.ParseCIDR(cfg.ZTPNetwork)
+	if err != nil {
+		return ztp.Config{}, fmt.Errorf("invalid ZTP network %s: %w", cfg.ZTPNetwork, err)
+	}
+
+	// Parse gateway (default to first usable IP in network)
+	var gateway net.IP
+	if cfg.ZTPGateway != "" {
+		gateway = net.ParseIP(cfg.ZTPGateway)
+		if gateway == nil {
+			return ztp.Config{}, fmt.Errorf("invalid ZTP gateway %s", cfg.ZTPGateway)
+		}
+	} else {
+		// Default gateway is first IP + 1 (skip network address)
+		gateway = make(net.IP, 4)
+		copy(gateway, network.IP.To4())
+		gateway[3]++
+	}
+
+	// Parse DNS servers
+	var dnsServers []net.IP
+	if cfg.ZTPDNS != "" {
+		for _, dnsStr := range strings.Split(cfg.ZTPDNS, ",") {
+			dnsStr = strings.TrimSpace(dnsStr)
+			dns := net.ParseIP(dnsStr)
+			if dns == nil {
+				return ztp.Config{}, fmt.Errorf("invalid DNS server %s", dnsStr)
+			}
+			dnsServers = append(dnsServers, dns)
+		}
+	}
+
+	// Get server IP from interface for Nexus URL
+	iface, err := net.InterfaceByName(cfg.ZTPInterface)
+	if err != nil {
+		return ztp.Config{}, fmt.Errorf("failed to get interface %s: %w", cfg.ZTPInterface, err)
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return ztp.Config{}, fmt.Errorf("failed to get interface addresses: %w", err)
+	}
+
+	var serverIP net.IP
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+			serverIP = ipnet.IP.To4()
+			break
+		}
+	}
+	if serverIP == nil {
+		return ztp.Config{}, fmt.Errorf("no IPv4 address found on interface %s", cfg.ZTPInterface)
+	}
+
+	// Build Nexus URL from server IP and HTTP port
+	nexusURL := fmt.Sprintf("http://%s:%d", serverIP, cfg.HTTPPort)
+
+	return ztp.Config{
+		Interface: cfg.ZTPInterface,
+		Network:   *network,
+		Gateway:   gateway,
+		DNS:       dnsServers,
+		LeaseTime: 24 * time.Hour,
+		NexusURL:  nexusURL,
+	}, nil
 }
 
 // loadOrGenerateKey loads an existing private key or generates a new one.
