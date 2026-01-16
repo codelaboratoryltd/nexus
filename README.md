@@ -100,4 +100,6 @@ nexus/
 
 ## License
 
-Proprietary - Code Laboratory Ltd
+BSL 1.1 (Business Source License) - see [LICENSE](LICENSE)
+
+Converts to Apache 2.0 on January 1, 2030.
