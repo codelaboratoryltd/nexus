@@ -9,6 +9,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/codelaboratoryltd/nexus/internal/store"
+	"github.com/codelaboratoryltd/nexus/internal/validation"
 )
 
 // AllocationRequest represents an allocation creation request.
@@ -36,6 +37,12 @@ func (s *Server) listAllocations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate pool ID from query parameter
+	if err := validation.ValidatePoolID(poolID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	allocations, err := s.allocStore.ListAllocationsByPool(ctx, poolID)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err.Error())
@@ -59,17 +66,19 @@ func (s *Server) createAllocation(w http.ResponseWriter, r *http.Request) {
 
 	var req AllocationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
+		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}
 
-	if req.PoolID == "" {
-		respondError(w, http.StatusBadRequest, "pool_id is required")
+	// Validate pool ID
+	if err := validation.ValidatePoolID(req.PoolID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if req.SubscriberID == "" {
-		respondError(w, http.StatusBadRequest, "subscriber_id is required")
+	// Validate subscriber ID
+	if err := validation.ValidateSubscriberID(req.SubscriberID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -82,11 +91,13 @@ func (s *Server) createAllocation(w http.ResponseWriter, r *http.Request) {
 
 	var ip net.IP
 	if req.IP != "" {
-		ip = net.ParseIP(req.IP)
-		if ip == nil {
-			respondError(w, http.StatusBadRequest, "invalid IP address")
+		// Validate and parse IP address
+		parsedIP, err := validation.ValidateIPAddress(req.IP)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		ip = parsedIP
 	} else {
 		// Allocate from hashring based on subscriber ID
 		allocatedIP := s.ring.AllocateIP(req.PoolID, req.SubscriberID)
@@ -118,6 +129,12 @@ func (s *Server) getAllocation(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	subscriberID := vars["subscriber_id"]
 
+	// Validate subscriber ID from URL
+	if err := validation.ValidateSubscriberID(subscriberID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	allocation, err := s.allocStore.GetAllocationBySubscriber(ctx, subscriberID)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "allocation not found")
@@ -133,6 +150,20 @@ func (s *Server) deleteAllocation(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	subscriberID := vars["subscriber_id"]
 	poolID := r.URL.Query().Get("pool_id")
+
+	// Validate subscriber ID from URL
+	if err := validation.ValidateSubscriberID(subscriberID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate pool ID if provided
+	if poolID != "" {
+		if err := validation.ValidatePoolID(poolID); err != nil {
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	if poolID == "" {
 		// Try to find the allocation first

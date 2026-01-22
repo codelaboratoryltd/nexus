@@ -2,12 +2,12 @@ package api
 
 import (
 	"encoding/json"
-	"net"
 	"net/http"
 
 	"github.com/gorilla/mux"
 
 	"github.com/codelaboratoryltd/nexus/internal/store"
+	"github.com/codelaboratoryltd/nexus/internal/validation"
 )
 
 // PoolRequest represents a pool creation request.
@@ -57,23 +57,46 @@ func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 
 	var req PoolRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "invalid request body")
+		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}
 
-	if req.ID == "" {
-		respondError(w, http.StatusBadRequest, "pool id is required")
+	// Validate pool ID
+	if err := validation.ValidatePoolID(req.ID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if req.CIDR == "" {
-		respondError(w, http.StatusBadRequest, "cidr is required")
-		return
-	}
-
-	_, ipNet, err := net.ParseCIDR(req.CIDR)
+	// Validate CIDR
+	ipNet, err := validation.ValidateCIDR(req.CIDR)
 	if err != nil {
-		respondError(w, http.StatusBadRequest, "invalid cidr format")
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate prefix if provided
+	if req.Prefix > 0 {
+		if err := validation.ValidatePrefixForCIDR(ipNet, req.Prefix); err != nil {
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	// Validate sharding factor
+	if err := validation.ValidateShardingFactor(req.ShardingFactor); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate exclusions
+	if err := validation.ValidateExclusions(req.Exclusions); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate metadata
+	if err := validation.ValidateMetadata(req.Metadata); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -108,6 +131,12 @@ func (s *Server) getPool(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	poolID := vars["id"]
 
+	// Validate pool ID from URL
+	if err := validation.ValidatePoolID(poolID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	pool, err := s.poolStore.GetPool(ctx, poolID)
 	if err != nil {
 		respondError(w, http.StatusNotFound, "pool not found")
@@ -122,6 +151,12 @@ func (s *Server) deletePool(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
 	poolID := vars["id"]
+
+	// Validate pool ID from URL
+	if err := validation.ValidatePoolID(poolID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if err := s.poolStore.DeletePool(ctx, poolID); err != nil {
 		respondError(w, http.StatusInternalServerError, err.Error())
