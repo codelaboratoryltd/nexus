@@ -142,73 +142,105 @@ olt:
 ```
 nexus/
 ├── cmd/
-│   ├── nexus/              # Main server
-│   ├── cli/                # Management CLI
-│   └── migrate/            # Data migration tools
+│   └── nexus/              # Main server
 │
 ├── internal/
-│   ├── api/                # HTTP/gRPC handlers
-│   │   ├── handlers.go
-│   │   ├── middleware.go
-│   │   └── v1/             # API version 1
+│   ├── api/                # HTTP handlers (REST API)
+│   │   ├── api.go          # Router setup
+│   │   ├── pools.go        # Pool endpoints
+│   │   ├── allocations.go  # Allocation endpoints
+│   │   └── nodes.go        # Node endpoints
+│   │
+│   ├── audit/              # Security audit logging
+│   │   ├── logger.go       # Audit logger
+│   │   ├── middleware.go   # HTTP audit middleware
+│   │   └── types.go        # Event types
+│   │
+│   ├── validation/         # Input validation
+│   │   └── validation.go   # Validation functions
 │   │
 │   ├── state/              # State management
-│   │   ├── manager.go      # Main state coordinator
-│   │   ├── membership.go   # Node membership handling
-│   │   └── sync.go         # State synchronization
+│   │   └── manager.go      # Main state coordinator
 │   │
 │   ├── resource/           # Generic resource framework
-│   │   ├── interfaces.go   # Resource, Allocator, Pool, Type
-│   │   ├── registry.go     # Resource type registry
-│   │   ├── ipv4/           # IPv4 implementation
-│   │   ├── ipv6/           # IPv6 implementation
-│   │   ├── vlan/           # VLAN implementation
-│   │   └── port/           # Port implementation
+│   │   ├── interfaces.go   # Resource, Allocator interfaces
+│   │   └── types.go        # Resource types
 │   │
 │   ├── hashring/           # Consistent hashing
-│   │   ├── virtual.go      # Virtual node hashring
-│   │   └── shard.go        # Shard management
+│   │   ├── hashring.go     # Basic hashring
+│   │   └── virtual.go      # Virtual node support
 │   │
 │   ├── store/              # Persistence layer
-│   │   ├── pool.go         # Pool CRUD
-│   │   ├── allocation.go   # Allocation CRUD
-│   │   ├── node.go         # Node registry
-│   │   └── config.go       # Configuration store
+│   │   ├── models.go       # Data models
+│   │   ├── poolstore.go    # Pool CRUD
+│   │   └── allocstore.go   # Allocation CRUD
 │   │
-│   ├── bootstrap/          # OLT bootstrap
-│   │   ├── handler.go      # Bootstrap API
-│   │   ├── provision.go    # Provisioning logic
-│   │   └── config.go       # Config generation
+│   ├── keys/               # Key generation
+│   │   └── keys.go         # Key utilities
 │   │
-│   ├── metrics/            # Prometheus metrics
-│   │   ├── state.go
-│   │   ├── api.go
-│   │   └── allocator.go
+│   ├── ztp/                # Zero Touch Provisioning
+│   │   └── handler.go      # ZTP handlers
 │   │
 │   └── util/               # Utilities
-│       ├── marshal.go
-│       └── errors.go
-│
-├── api/
-│   ├── openapi.yaml        # OpenAPI spec
-│   └── proto/              # gRPC definitions
-│       └── nexus.proto
+│       ├── marshal.go      # Marshalling helpers
+│       └── ipconversion.go # IP conversion utilities
 │
 ├── docs/
-│   ├── DESIGN.md           # This document
-│   ├── API.md              # API documentation
-│   └── OPERATIONS.md       # Operations guide
+│   ├── COMPETITIVE_ANALYSIS.md  # VOLTHA/SEBA comparison
+│   └── (see DESIGN.md in root)
 │
 ├── Dockerfile
 ├── go.mod
 └── README.md
 ```
 
+**Planned but not yet implemented:**
+- `cmd/cli/` - Management CLI
+- `cmd/migrate/` - Data migration tools
+- `api/proto/` - gRPC definitions (currently REST-only)
+- `api/openapi.yaml` - OpenAPI spec
+
 ## API Design
 
 ### REST API (v1)
 
-#### Bootstrap
+#### Health & Readiness (Implemented)
+
+```
+GET /health                             Health check
+GET /ready                              Readiness check
+```
+
+#### Pools (Implemented)
+
+```
+GET    /api/v1/pools                    List all pools
+POST   /api/v1/pools                    Create pool
+GET    /api/v1/pools/{id}               Get pool details
+DELETE /api/v1/pools/{id}               Delete pool
+```
+
+#### Allocations (Implemented)
+
+```
+GET    /api/v1/allocations              List allocations (requires pool_id query param)
+POST   /api/v1/allocations              Create allocation
+  Body: { pool_id, subscriber_id, ip (optional) }
+  Response: { pool_id, subscriber_id, ip, timestamp }
+
+GET    /api/v1/allocations/{subscriber_id}    Get subscriber allocation
+DELETE /api/v1/allocations/{subscriber_id}    Delete allocation
+```
+
+#### Nodes (Implemented - Basic)
+
+```
+GET    /api/v1/nodes                    List OLT-BNG nodes
+```
+
+#### Bootstrap (Planned)
+
+> **Note**: Bootstrap endpoints are planned but not yet implemented.
 
 ```
 POST /api/v1/bootstrap
@@ -218,51 +250,20 @@ POST /api/v1/bootstrap
 
 GET /api/v1/bootstrap/{olt_id}/config
   Get current configuration for OLT
-  Response: { pools, routes, policies }
 
 POST /api/v1/bootstrap/{olt_id}/heartbeat
   Update OLT heartbeat
-  Body: { active_subscribers, metrics }
 ```
 
-#### Pools
+### gRPC API (Planned)
 
-```
-GET    /api/v1/pools                    List all pools
-POST   /api/v1/pools                    Create pool
-GET    /api/v1/pools/{id}               Get pool details
-PUT    /api/v1/pools/{id}               Update pool
-DELETE /api/v1/pools/{id}               Delete pool
-GET    /api/v1/pools/{id}/stats         Pool allocation statistics
-```
-
-#### Allocations
-
-```
-POST   /api/v1/allocate                 Allocate resource
-  Body: { pool_id, subscriber_id, olt_id, metadata }
-  Response: { allocation }
-
-DELETE /api/v1/allocate/{subscriber_id} Deallocate resource
-
-GET    /api/v1/allocations              List allocations (with filters)
-GET    /api/v1/allocations/{subscriber} Get subscriber allocation
-```
-
-#### Nodes
-
-```
-GET    /api/v1/nodes                    List OLT-BNG nodes
-GET    /api/v1/nodes/{id}               Get node details
-DELETE /api/v1/nodes/{id}               Deregister node (drain first)
-POST   /api/v1/nodes/{id}/drain         Start draining node
-```
-
-### gRPC API
+> **Note**: gRPC is planned but not yet implemented. Currently all APIs are REST-only.
+> The design below shows the intended future gRPC interface.
 
 For high-frequency operations (allocation lookups from OLT-BNG):
 
 ```protobuf
+// PLANNED - NOT YET IMPLEMENTED
 service Nexus {
   // Bootstrap
   rpc Register(RegisterRequest) returns (RegisterResponse);

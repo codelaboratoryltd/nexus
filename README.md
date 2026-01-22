@@ -39,6 +39,12 @@ go build -o nexus ./cmd/nexus
 | `/ready` | GET | Readiness check |
 | `/api/v1/pools` | GET | List resource pools |
 | `/api/v1/pools` | POST | Create resource pool |
+| `/api/v1/pools/{id}` | GET | Get pool details |
+| `/api/v1/pools/{id}` | DELETE | Delete pool |
+| `/api/v1/allocations` | GET | List allocations (requires pool_id) |
+| `/api/v1/allocations` | POST | Create allocation |
+| `/api/v1/allocations/{subscriber_id}` | GET | Get subscriber allocation |
+| `/api/v1/allocations/{subscriber_id}` | DELETE | Delete allocation |
 | `/api/v1/nodes` | GET | List cluster nodes |
 
 ## Ports
@@ -86,14 +92,19 @@ go fmt ./...
 nexus/
 ├── cmd/nexus/           # Main entry point
 ├── internal/
-│   ├── api/             # HTTP/gRPC handlers
+│   ├── api/             # HTTP handlers (REST API)
+│   ├── audit/           # Security audit logging
+│   ├── validation/      # Input validation
 │   ├── hashring/        # Consistent hashing
 │   ├── resource/        # Generic resource framework
 │   ├── state/           # State management
-│   └── store/           # Persistence
+│   ├── store/           # Persistence layer
+│   ├── keys/            # Key generation utilities
+│   ├── ztp/             # Zero Touch Provisioning
+│   └── util/            # Utility functions
 ├── docs/
-│   ├── DESIGN.md
 │   └── COMPETITIVE_ANALYSIS.md
+├── DESIGN.md            # Architecture documentation
 ├── Dockerfile
 └── go.mod
 ```
