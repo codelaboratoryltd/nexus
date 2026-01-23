@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 ARG VERSION=dev
 ARG COMMIT=unknown
@@ -7,7 +7,7 @@ WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=ssh go mod download
 
 # Copy source
 COPY . .
