@@ -12,20 +12,38 @@ import (
 
 // Server provides the HTTP API for Nexus.
 type Server struct {
-	ring       *hashring.VirtualHashRing
-	poolStore  store.PoolStore
-	nodeStore  store.NodeStore
-	allocStore store.AllocationStore
+	ring        *hashring.VirtualHashRing
+	poolStore   store.PoolStore
+	nodeStore   store.NodeStore
+	allocStore  store.AllocationStore
+	deviceStore store.DeviceStore
 }
 
 // NewServer creates a new API server.
 func NewServer(ring *hashring.VirtualHashRing, poolStore store.PoolStore, nodeStore store.NodeStore, allocStore store.AllocationStore) *Server {
 	return &Server{
-		ring:       ring,
-		poolStore:  poolStore,
-		nodeStore:  nodeStore,
-		allocStore: allocStore,
+		ring:        ring,
+		poolStore:   poolStore,
+		nodeStore:   nodeStore,
+		allocStore:  allocStore,
+		deviceStore: nil, // Use SetDeviceStore to enable bootstrap API
 	}
+}
+
+// NewServerWithDevices creates a new API server with device store support.
+func NewServerWithDevices(ring *hashring.VirtualHashRing, poolStore store.PoolStore, nodeStore store.NodeStore, allocStore store.AllocationStore, deviceStore store.DeviceStore) *Server {
+	return &Server{
+		ring:        ring,
+		poolStore:   poolStore,
+		nodeStore:   nodeStore,
+		allocStore:  allocStore,
+		deviceStore: deviceStore,
+	}
+}
+
+// SetDeviceStore sets the device store, enabling the bootstrap API.
+func (s *Server) SetDeviceStore(deviceStore store.DeviceStore) {
+	s.deviceStore = deviceStore
 }
 
 // RegisterRoutes registers all API routes on the given router.
@@ -51,6 +69,13 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	api.HandleFunc("/allocations", s.createAllocation).Methods("POST")
 	api.HandleFunc("/allocations/{subscriber_id}", s.getAllocation).Methods("GET")
 	api.HandleFunc("/allocations/{subscriber_id}", s.deleteAllocation).Methods("DELETE")
+
+	// Bootstrap (device registration)
+	if s.deviceStore != nil {
+		api.HandleFunc("/bootstrap", s.bootstrap).Methods("POST")
+		api.HandleFunc("/devices", s.listDevices).Methods("GET")
+		api.HandleFunc("/devices/{node_id}", s.getDevice).Methods("GET")
+	}
 }
 
 // respondJSON writes a JSON response.
