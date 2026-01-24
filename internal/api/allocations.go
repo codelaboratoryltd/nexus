@@ -16,7 +16,8 @@ import (
 type AllocationRequest struct {
 	PoolID       string `json:"pool_id"`
 	SubscriberID string `json:"subscriber_id"`
-	IP           string `json:"ip,omitempty"` // Optional: specify IP or let system allocate
+	IP           string `json:"ip,omitempty"`      // Optional: specify IP or let system allocate
+	NodeID       string `json:"node_id,omitempty"` // Optional: primary node that owns this allocation
 }
 
 // AllocationResponse represents an allocation in API responses.
@@ -25,6 +26,21 @@ type AllocationResponse struct {
 	SubscriberID string    `json:"subscriber_id"`
 	IP           string    `json:"ip"`
 	Timestamp    time.Time `json:"timestamp"`
+	NodeID       string    `json:"node_id,omitempty"`
+	BackupNodeID string    `json:"backup_node_id,omitempty"`
+	IsBackup     bool      `json:"is_backup,omitempty"`
+}
+
+// BackupAllocationRequest represents a request to create backup allocations.
+type BackupAllocationRequest struct {
+	BackupNodeID string `json:"backup_node_id"` // The standby node to assign backup allocations to
+}
+
+// BackupAllocationResponse represents a backup allocation assignment result.
+type BackupAllocationResponse struct {
+	PoolID           string `json:"pool_id"`
+	BackupNodeID     string `json:"backup_node_id"`
+	AllocationsCount int    `json:"allocations_count"`
 }
 
 // listAllocations returns allocations, optionally filtered by pool.
@@ -82,6 +98,14 @@ func (s *Server) createAllocation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate node ID if provided
+	if req.NodeID != "" {
+		if err := validation.ValidateNodeID(req.NodeID); err != nil {
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
 	// Check if subscriber already has an allocation
 	existing, err := s.allocStore.GetAllocationBySubscriber(ctx, req.SubscriberID)
 	if err == nil && existing != nil {
@@ -113,6 +137,7 @@ func (s *Server) createAllocation(w http.ResponseWriter, r *http.Request) {
 		SubscriberID: req.SubscriberID,
 		IP:           ip,
 		Timestamp:    time.Now(),
+		NodeID:       req.NodeID,
 	}
 
 	if err := s.allocStore.SaveAllocation(ctx, allocation); err != nil {
@@ -190,5 +215,146 @@ func allocationToResponse(a *store.Allocation) AllocationResponse {
 		SubscriberID: a.SubscriberID,
 		IP:           a.IP.String(),
 		Timestamp:    a.Timestamp,
+		NodeID:       a.NodeID,
+		BackupNodeID: a.BackupNodeID,
+		IsBackup:     a.IsBackup,
 	}
+}
+
+// createBackupAllocations assigns backup allocations for a pool to a standby node.
+// POST /api/v1/pools/{pool_id}/backup-allocations
+func (s *Server) createBackupAllocations(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	poolID := vars["pool_id"]
+
+	// Validate pool ID from URL
+	if err := validation.ValidatePoolID(poolID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req BackupAllocationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
+		return
+	}
+
+	// Validate backup node ID
+	if err := validation.ValidateNodeID(req.BackupNodeID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Get the pool to check backup ratio
+	pool, err := s.poolStore.GetPool(ctx, poolID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "pool not found")
+		return
+	}
+
+	// Get all allocations for this pool
+	allocations, err := s.allocStore.ListAllocationsByPool(ctx, poolID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Calculate how many allocations this backup node should receive based on backup ratio
+	// For now, we assign backup status to all allocations that don't already have a backup node
+	assignedCount := 0
+	for _, alloc := range allocations {
+		// Skip allocations that already have a backup node or are themselves backups
+		if alloc.BackupNodeID != "" || alloc.IsBackup {
+			continue
+		}
+
+		// Skip allocations owned by the backup node itself (can't be your own backup)
+		if alloc.NodeID == req.BackupNodeID {
+			continue
+		}
+
+		// Assign this allocation to the backup node
+		if err := s.allocStore.AssignBackupNode(ctx, poolID, alloc.SubscriberID, req.BackupNodeID); err != nil {
+			respondError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		assignedCount++
+
+		// Limit by backup ratio if set
+		if pool.BackupRatio > 0 {
+			maxBackups := int(float64(len(allocations)) * pool.BackupRatio)
+			if assignedCount >= maxBackups {
+				break
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusCreated, BackupAllocationResponse{
+		PoolID:           poolID,
+		BackupNodeID:     req.BackupNodeID,
+		AllocationsCount: assignedCount,
+	})
+}
+
+// listBackupAllocations returns all backup allocations for a node.
+// GET /api/v1/nodes/{node_id}/backup-allocations
+func (s *Server) listBackupAllocations(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	nodeID := vars["node_id"]
+
+	// Validate node ID from URL
+	if err := validation.ValidateNodeID(nodeID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	allocations, err := s.allocStore.ListBackupAllocationsByNode(ctx, nodeID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	response := make([]AllocationResponse, 0, len(allocations))
+	for _, a := range allocations {
+		response = append(response, allocationToResponse(a))
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"allocations":    response,
+		"count":          len(response),
+		"backup_node_id": nodeID,
+	})
+}
+
+// listNodeAllocations returns all primary allocations for a node.
+// GET /api/v1/nodes/{node_id}/allocations
+func (s *Server) listNodeAllocations(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	nodeID := vars["node_id"]
+
+	// Validate node ID from URL
+	if err := validation.ValidateNodeID(nodeID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	allocations, err := s.allocStore.ListAllocationsByNode(ctx, nodeID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	response := make([]AllocationResponse, 0, len(allocations))
+	for _, a := range allocations {
+		response = append(response, allocationToResponse(a))
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"allocations": response,
+		"count":       len(response),
+		"node_id":     nodeID,
+	})
 }

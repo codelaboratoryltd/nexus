@@ -14,21 +14,23 @@ import (
 
 // Error types for validation failures
 var (
-	ErrEmptyValue        = fmt.Errorf("value cannot be empty")
-	ErrInvalidFormat     = fmt.Errorf("invalid format")
-	ErrValueTooLong      = fmt.Errorf("value exceeds maximum length")
-	ErrValueTooShort     = fmt.Errorf("value is too short")
-	ErrInvalidCharacters = fmt.Errorf("value contains invalid characters")
-	ErrOutOfRange        = fmt.Errorf("value is out of valid range")
-	ErrInvalidCIDR       = fmt.Errorf("invalid CIDR notation")
-	ErrInvalidIP         = fmt.Errorf("invalid IP address")
-	ErrInvalidMAC        = fmt.Errorf("invalid MAC address")
-	ErrInvalidVLAN       = fmt.Errorf("invalid VLAN ID")
-	ErrInvalidPrefix     = fmt.Errorf("invalid prefix length")
-	ErrInvalidSerial     = fmt.Errorf("invalid serial number")
-	ErrInvalidPoolID     = fmt.Errorf("invalid pool ID")
-	ErrInvalidSubscriber = fmt.Errorf("invalid subscriber ID")
-	ErrDangerousInput    = fmt.Errorf("potentially dangerous input detected")
+	ErrEmptyValue         = fmt.Errorf("value cannot be empty")
+	ErrInvalidFormat      = fmt.Errorf("invalid format")
+	ErrValueTooLong       = fmt.Errorf("value exceeds maximum length")
+	ErrValueTooShort      = fmt.Errorf("value is too short")
+	ErrInvalidCharacters  = fmt.Errorf("value contains invalid characters")
+	ErrOutOfRange         = fmt.Errorf("value is out of valid range")
+	ErrInvalidCIDR        = fmt.Errorf("invalid CIDR notation")
+	ErrInvalidIP          = fmt.Errorf("invalid IP address")
+	ErrInvalidMAC         = fmt.Errorf("invalid MAC address")
+	ErrInvalidVLAN        = fmt.Errorf("invalid VLAN ID")
+	ErrInvalidPrefix      = fmt.Errorf("invalid prefix length")
+	ErrInvalidSerial      = fmt.Errorf("invalid serial number")
+	ErrInvalidPoolID      = fmt.Errorf("invalid pool ID")
+	ErrInvalidSubscriber  = fmt.Errorf("invalid subscriber ID")
+	ErrDangerousInput     = fmt.Errorf("potentially dangerous input detected")
+	ErrInvalidBackupRatio = fmt.Errorf("invalid backup ratio")
+	ErrInvalidNodeID      = fmt.Errorf("invalid node ID")
 )
 
 // ValidationError provides detailed information about validation failures
@@ -75,6 +77,9 @@ const (
 	MaxIPv4Prefix          = 32
 	MinIPv6Prefix          = 16
 	MaxIPv6Prefix          = 128
+	MinBackupRatio         = 0.0
+	MaxBackupRatio         = 1.0
+	MaxNodeIDLength        = 128
 )
 
 // Precompiled regular expressions for common patterns
@@ -417,5 +422,36 @@ func ValidateRequestSize(size int64, maxSize int64) error {
 		return NewValidationError("request_body", fmt.Sprintf("%d bytes", size),
 			fmt.Sprintf("request body exceeds maximum size of %d bytes", maxSize), ErrOutOfRange)
 	}
+	return nil
+}
+
+// ValidateBackupRatio validates a backup ratio value (0.0 to 1.0)
+func ValidateBackupRatio(ratio float64) error {
+	if ratio < MinBackupRatio || ratio > MaxBackupRatio {
+		return NewValidationError("backup_ratio", fmt.Sprintf("%f", ratio),
+			fmt.Sprintf("backup ratio must be between %f and %f", MinBackupRatio, MaxBackupRatio), ErrInvalidBackupRatio)
+	}
+	return nil
+}
+
+// ValidateNodeID validates a node identifier
+func ValidateNodeID(id string) error {
+	if id == "" {
+		return NewValidationError("node_id", id, "node ID is required", ErrEmptyValue)
+	}
+
+	if len(id) > MaxNodeIDLength {
+		return NewValidationError("node_id", id, fmt.Sprintf("node ID exceeds maximum length of %d", MaxNodeIDLength), ErrValueTooLong)
+	}
+
+	// Use same pattern as pool ID - alphanumeric characters, hyphens, underscores, and dots
+	if !poolIDPattern.MatchString(id) {
+		return NewValidationError("node_id", id, "node ID must contain only alphanumeric characters, hyphens, underscores, and dots", ErrInvalidFormat)
+	}
+
+	if err := checkDangerousInput(id); err != nil {
+		return NewValidationError("node_id", id, "node ID contains potentially dangerous characters", err)
+	}
+
 	return nil
 }
