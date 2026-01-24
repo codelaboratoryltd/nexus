@@ -69,8 +69,10 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	// Allocations
 	api.HandleFunc("/allocations", s.listAllocations).Methods("GET")
 	api.HandleFunc("/allocations", s.createAllocation).Methods("POST")
+	api.HandleFunc("/allocations/expiring", s.listExpiringAllocations).Methods("GET")
 	api.HandleFunc("/allocations/{subscriber_id}", s.getAllocation).Methods("GET")
 	api.HandleFunc("/allocations/{subscriber_id}", s.deleteAllocation).Methods("DELETE")
+	api.HandleFunc("/allocations/{subscriber_id}/renew", s.renewAllocation).Methods("POST")
 
 	// Backup Allocations
 	api.HandleFunc("/pools/{pool_id}/backup-allocations", s.createBackupAllocations).Methods("POST")

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
+	"time"
 
 	"github.com/codelaboratoryltd/nexus/internal/resource"
 	"github.com/codelaboratoryltd/nexus/internal/util"
@@ -23,6 +25,14 @@ type allocationStore struct {
 	subscriberPrefix     ds.Key
 	nodePrefix           ds.Key
 	backupNodePrefix     ds.Key
+	epochPrefix          ds.Key // Epoch-based index: /epoch/{epoch}/{poolID}/{subscriberID}
+
+	// Epoch tracking for lease expiration (Demo F - WiFi mode)
+	// Uses epoch-based expiration: allocations expire when Epoch < currentEpoch - gracePeriod
+	currentEpoch uint64
+	epochMu      sync.RWMutex
+	epochPeriod  time.Duration // How often epochs advance (default: 1 hour)
+	gracePeriod  uint64        // Number of epochs before expiration (default: 2)
 }
 
 // NewAllocationStore creates a new allocation store.
@@ -34,6 +44,10 @@ func NewAllocationStore(store ds.Batching, poolAllocationPrefix, subscriberPrefi
 		subscriberPrefix:     subscriberPrefix,
 		nodePrefix:           ds.NewKey("/node"),
 		backupNodePrefix:     ds.NewKey("/backup-node"),
+		epochPrefix:          ds.NewKey("/epoch"),
+		currentEpoch:         1, // Start at epoch 1
+		epochPeriod:          1 * time.Hour,
+		gracePeriod:          2, // Two-epoch grace period
 	}
 }
 
@@ -67,6 +81,11 @@ func (as *allocationStore) SaveAllocation(ctx context.Context, a *Allocation) er
 		NodeID:       a.NodeID,
 		BackupNodeID: a.BackupNodeID,
 		IsBackup:     a.IsBackup,
+		TTL:          a.TTL,
+		Epoch:        a.Epoch,
+		ExpiresAt:    a.ExpiresAt,
+		LastRenewed:  a.LastRenewed,
+		AllocType:    a.AllocType,
 	}
 	valueBytes, err := cbor.Marshal(allocValue)
 	if err != nil {
@@ -102,6 +121,16 @@ func (as *allocationStore) SaveAllocation(ctx context.Context, a *Allocation) er
 		backupNodeKey := as.backupNodePrefix.ChildString(a.BackupNodeID).ChildString(a.PoolID).ChildString(a.SubscriberID).ChildString(offsetBase64)
 		if err := b.Put(ctx, backupNodeKey, valueBytes); err != nil {
 			return fmt.Errorf("failed to update backup node index: %w", err)
+		}
+	}
+
+	// Store epoch index if TTL is set (Demo F - WiFi mode)
+	// Key format: /epoch/{epoch}/{poolID}/{subscriberID}
+	if a.TTL > 0 && a.Epoch > 0 {
+		epochStr := fmt.Sprintf("%020d", a.Epoch) // Zero-padded for lexicographic ordering
+		epochKey := as.epochPrefix.ChildString(epochStr).ChildString(a.PoolID).ChildString(a.SubscriberID)
+		if err := b.Put(ctx, epochKey, valueBytes); err != nil {
+			return fmt.Errorf("failed to update epoch index: %w", err)
 		}
 	}
 
@@ -465,4 +494,218 @@ func (as *allocationStore) unmarshalNodeKey(key ds.Key) (*AllocationKey, error) 
 		IPOffset:     new(big.Int).SetBytes(offsetBytes),
 		SubscriberID: subscriberID,
 	}, nil
+}
+
+// RenewAllocation renews an allocation's lease by updating its epoch.
+// If newTTL is provided (> 0), it updates the TTL value as well.
+// Returns the updated allocation.
+func (as *allocationStore) RenewAllocation(ctx context.Context, poolID, subscriberID string, newTTL int64) (*Allocation, error) {
+	// Get the existing allocation
+	alloc, err := as.GetAllocation(ctx, poolID, subscriberID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get allocation: %w", err)
+	}
+
+	// Check if this is a renewable allocation
+	if alloc.TTL == 0 && newTTL == 0 {
+		return nil, fmt.Errorf("cannot renew allocation with no TTL")
+	}
+
+	// Remove old epoch index entry if it exists
+	if alloc.Epoch > 0 {
+		oldEpochStr := fmt.Sprintf("%020d", alloc.Epoch)
+		oldEpochKey := as.epochPrefix.ChildString(oldEpochStr).ChildString(poolID).ChildString(subscriberID)
+		_ = as.store.Delete(ctx, oldEpochKey) // Ignore error if key doesn't exist
+	}
+
+	// Update allocation with new epoch (current epoch)
+	now := time.Now()
+	currentEpoch := as.GetCurrentEpoch()
+	alloc.Epoch = currentEpoch
+	alloc.LastRenewed = now
+
+	// Update TTL if provided
+	if newTTL > 0 {
+		alloc.TTL = newTTL
+	}
+
+	// Calculate approximate expiration time (informational)
+	// ExpiresAt = now + (gracePeriod * epochPeriod)
+	alloc.ExpiresAt = now.Add(time.Duration(as.gracePeriod) * as.epochPeriod)
+
+	// Save the updated allocation (this will create new epoch index entry)
+	if err := as.SaveAllocation(ctx, alloc); err != nil {
+		return nil, fmt.Errorf("failed to save renewed allocation: %w", err)
+	}
+
+	return alloc, nil
+}
+
+// ListExpiringAllocations returns allocations that will expire within the specified time window.
+// This is calculated based on epochs: allocations with Epoch <= threshold will be returned,
+// where threshold = currentEpoch - gracePeriod + epochsWithinWindow.
+func (as *allocationStore) ListExpiringAllocations(ctx context.Context, before time.Time) ([]*Allocation, error) {
+	// Calculate how many epochs fit in the time window
+	timeDelta := time.Until(before)
+	if timeDelta < 0 {
+		timeDelta = 0
+	}
+	epochsAway := uint64(timeDelta / as.epochPeriod)
+
+	// Calculate the epoch threshold
+	currentEpoch := as.GetCurrentEpoch()
+	threshold := currentEpoch + epochsAway
+
+	// Query the epoch index for entries with epoch < threshold
+	// Key format: /epoch/{epoch}/{poolID}/{subscriberID}
+	thresholdStr := fmt.Sprintf("%020d", threshold)
+
+	q := query.Query{Prefix: as.epochPrefix.String()}
+	results, err := as.store.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query epoch index: %w", err)
+	}
+	defer results.Close()
+
+	var allocs []*Allocation
+	for result := range results.Next() {
+		if result.Error != nil {
+			continue
+		}
+
+		key := ds.RawKey(result.Key)
+		parts := key.Namespaces()
+		if len(parts) < 4 {
+			continue
+		}
+
+		// Extract epoch from key
+		epochStr := parts[len(parts)-3]
+
+		// Compare lexicographically (works because we zero-padded the epoch)
+		if epochStr > thresholdStr {
+			continue // Skip entries that won't expire within the window
+		}
+
+		poolID := parts[len(parts)-2]
+		subscriberID := parts[len(parts)-1]
+
+		// Get the full allocation
+		alloc, err := as.GetAllocation(ctx, poolID, subscriberID)
+		if err != nil {
+			continue // Skip allocations that no longer exist
+		}
+
+		allocs = append(allocs, alloc)
+	}
+
+	return allocs, nil
+}
+
+// CleanupExpiredAllocations removes all allocations that have expired based on epoch.
+// An allocation is expired when its Epoch < currentEpoch - gracePeriod.
+// Returns the number of allocations deleted.
+func (as *allocationStore) CleanupExpiredAllocations(ctx context.Context) (int, error) {
+	currentEpoch := as.GetCurrentEpoch()
+
+	// Need at least gracePeriod+1 epochs to have any expired allocations
+	if currentEpoch <= as.gracePeriod {
+		return 0, nil
+	}
+
+	// Calculate expiration threshold
+	threshold := currentEpoch - as.gracePeriod
+	thresholdStr := fmt.Sprintf("%020d", threshold)
+
+	// Query the epoch index for entries with epoch < threshold
+	// Key format: /epoch/{epoch}/{poolID}/{subscriberID}
+	q := query.Query{Prefix: as.epochPrefix.String()}
+	results, err := as.store.Query(ctx, q)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query epoch index: %w", err)
+	}
+	defer results.Close()
+
+	deleted := 0
+	for result := range results.Next() {
+		if result.Error != nil {
+			continue
+		}
+
+		key := ds.RawKey(result.Key)
+		parts := key.Namespaces()
+		if len(parts) < 4 {
+			continue
+		}
+
+		// Extract epoch from key
+		epochStr := parts[len(parts)-3]
+
+		// Compare lexicographically (only process entries with epoch < threshold)
+		if epochStr >= thresholdStr {
+			continue // Not expired yet
+		}
+
+		poolID := parts[len(parts)-2]
+		subscriberID := parts[len(parts)-1]
+
+		// Remove the allocation
+		if err := as.RemoveAllocation(ctx, poolID, subscriberID); err != nil {
+			continue // Continue on error
+		}
+
+		// Remove epoch index entry
+		epochKey := as.epochPrefix.ChildString(epochStr).ChildString(poolID).ChildString(subscriberID)
+		_ = as.store.Delete(ctx, epochKey) // Ignore error
+
+		deleted++
+	}
+
+	return deleted, nil
+}
+
+// --- Epoch management (Demo F - WiFi mode) ---
+
+// GetCurrentEpoch returns the current epoch value.
+func (as *allocationStore) GetCurrentEpoch() uint64 {
+	as.epochMu.RLock()
+	defer as.epochMu.RUnlock()
+	return as.currentEpoch
+}
+
+// AdvanceEpoch increments the current epoch.
+// This should be called periodically (e.g., every epochPeriod).
+func (as *allocationStore) AdvanceEpoch() uint64 {
+	as.epochMu.Lock()
+	defer as.epochMu.Unlock()
+	as.currentEpoch++
+	return as.currentEpoch
+}
+
+// SetEpochPeriod configures the duration between epochs.
+func (as *allocationStore) SetEpochPeriod(d time.Duration) {
+	as.epochMu.Lock()
+	defer as.epochMu.Unlock()
+	as.epochPeriod = d
+}
+
+// SetGracePeriod configures the number of epochs before expiration.
+func (as *allocationStore) SetGracePeriod(epochs uint64) {
+	as.epochMu.Lock()
+	defer as.epochMu.Unlock()
+	as.gracePeriod = epochs
+}
+
+// GetEpochPeriod returns the current epoch period.
+func (as *allocationStore) GetEpochPeriod() time.Duration {
+	as.epochMu.RLock()
+	defer as.epochMu.RUnlock()
+	return as.epochPeriod
+}
+
+// GetGracePeriod returns the current grace period in epochs.
+func (as *allocationStore) GetGracePeriod() uint64 {
+	as.epochMu.RLock()
+	defer as.epochMu.RUnlock()
+	return as.gracePeriod
 }

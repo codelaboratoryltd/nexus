@@ -256,6 +256,35 @@ func runServer(cfg Config) error {
 		}()
 	}
 
+	// Start epoch-based allocation reaper (Demo F - WiFi mode)
+	// Uses epoch-based expiration: advances epoch periodically, then reclaims
+	// allocations where Epoch < currentEpoch - gracePeriod (default: 2 epochs)
+	go func() {
+		// Epoch advances every hour by default (configurable via allocStore.SetEpochPeriod)
+		ticker := time.NewTicker(allocStore.GetEpochPeriod())
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Advance epoch first
+				newEpoch := allocStore.AdvanceEpoch()
+				fmt.Printf("Epoch: advanced to %d\n", newEpoch)
+
+				// Then clean up expired allocations (epoch < currentEpoch - gracePeriod)
+				deleted, err := allocStore.CleanupExpiredAllocations(ctx)
+				if err != nil {
+					fmt.Printf("Reaper: error cleaning expired allocations: %v\n", err)
+				} else if deleted > 0 {
+					fmt.Printf("Reaper: cleaned up %d expired allocations (epoch threshold: %d)\n",
+						deleted, newEpoch-allocStore.GetGracePeriod())
+				}
+			}
+		}
+	}()
+
 	fmt.Println("Nexus ready!")
 
 	// Wait for shutdown signal

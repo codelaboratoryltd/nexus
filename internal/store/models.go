@@ -45,6 +45,18 @@ type Node struct {
 	Metadata   map[string]string `json:"metadata" cbor:"metadata"`
 }
 
+// AllocationType defines the type of allocation (for TTL behavior).
+type AllocationType string
+
+const (
+	// AllocationTypeSession is a session-based allocation that expires after TTL.
+	AllocationTypeSession AllocationType = "session"
+	// AllocationTypeSticky is a sticky allocation that can be renewed.
+	AllocationTypeSticky AllocationType = "sticky"
+	// AllocationTypePermanent is a permanent allocation with no expiration.
+	AllocationTypePermanent AllocationType = "permanent"
+)
+
 // Allocation represents an IP allocation for a subscriber.
 type Allocation struct {
 	PoolID       string    `json:"pool_id,omitempty" cbor:"pool_id"`
@@ -54,6 +66,14 @@ type Allocation struct {
 	NodeID       string    `json:"node_id,omitempty" cbor:"node_id"`               // Primary node that owns this allocation
 	BackupNodeID string    `json:"backup_node_id,omitempty" cbor:"backup_node_id"` // Standby node that has cached copy
 	IsBackup     bool      `json:"is_backup,omitempty" cbor:"is_backup"`           // True if this is a backup allocation
+
+	// TTL fields (Demo F - WiFi mode)
+	// Uses epoch-based expiration for efficiency: allocations expire when Epoch < currentEpoch - gracePeriod
+	TTL         int64          `json:"ttl,omitempty" cbor:"ttl"`                   // TTL in epochs (0 = permanent)
+	Epoch       uint64         `json:"epoch,omitempty" cbor:"epoch"`               // Epoch when allocation was created/renewed
+	ExpiresAt   time.Time      `json:"expires_at,omitempty" cbor:"expires_at"`     // Approximate expiration (informational)
+	LastRenewed time.Time      `json:"last_renewed,omitempty" cbor:"last_renewed"` // Last renewal timestamp
+	AllocType   AllocationType `json:"alloc_type,omitempty" cbor:"alloc_type"`     // Allocation type
 }
 
 // AllocationKey represents the key components for an allocation.
@@ -64,12 +84,20 @@ type AllocationKey struct {
 }
 
 // AllocationValue represents the stored value for an allocation.
-// This extends the legacy timestamp-only format with node backup information.
+// This extends the legacy timestamp-only format with node backup information and TTL.
 type AllocationValue struct {
 	Timestamp    time.Time `cbor:"timestamp"`
 	NodeID       string    `cbor:"node_id,omitempty"`
 	BackupNodeID string    `cbor:"backup_node_id,omitempty"`
 	IsBackup     bool      `cbor:"is_backup,omitempty"`
+
+	// TTL fields (Demo F - WiFi mode)
+	// Uses epoch-based expiration: allocations expire when Epoch < currentEpoch - gracePeriod
+	TTL         int64          `cbor:"ttl,omitempty"`
+	Epoch       uint64         `cbor:"epoch,omitempty"`
+	ExpiresAt   time.Time      `cbor:"expires_at,omitempty"`
+	LastRenewed time.Time      `cbor:"last_renewed,omitempty"`
+	AllocType   AllocationType `cbor:"alloc_type,omitempty"`
 }
 
 // GetAllocation reconstructs an Allocation from the key and value bytes.
@@ -101,5 +129,10 @@ func (a *AllocationKey) GetAllocation(p *Pool, keysValue []byte) (*Allocation, e
 		NodeID:       allocValue.NodeID,
 		BackupNodeID: allocValue.BackupNodeID,
 		IsBackup:     allocValue.IsBackup,
+		TTL:          allocValue.TTL,
+		Epoch:        allocValue.Epoch,
+		ExpiresAt:    allocValue.ExpiresAt,
+		LastRenewed:  allocValue.LastRenewed,
+		AllocType:    allocValue.AllocType,
 	}, nil
 }

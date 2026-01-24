@@ -67,7 +67,7 @@ func setupTestHashring(nodeIDs []string, poolCIDR string) *hashring.VirtualHashR
 		_ = ring.RegisterPool(hashring.IPPool{
 			ID:          "test-pool",
 			Network:     network,
-			VNodesCount: 4,
+			VNodesCount: 12, // Use 12 vnodes to ensure each node gets at least some partitions
 		})
 	}
 
@@ -405,16 +405,27 @@ func TestReassignerMetrics(t *testing.T) {
 		Metrics:  metrics,
 	})
 
-	// Get initial partition count for node2
+	// Get initial partition count - find a node that has partitions
 	mappingBefore := ring.GetHashMapping()
-	node2Partitions := mappingBefore.ListOwnedVirtualHashes(hashring.NodeID("node2"))
-	expectedPartitionsMoved := 0
-	for _, vnodes := range node2Partitions {
-		expectedPartitionsMoved += len(vnodes)
+
+	// Find a node with partitions to fail
+	failNode := ""
+	for _, nodeID := range []string{"node1", "node2", "node3"} {
+		partitions := mappingBefore.ListOwnedVirtualHashes(hashring.NodeID(nodeID))
+		count := 0
+		for _, vnodes := range partitions {
+			count += len(vnodes)
+		}
+		if count > 0 && failNode == "" {
+			failNode = nodeID
+		}
+	}
+	if failNode == "" {
+		t.Fatal("No node has partitions")
 	}
 
-	// Trigger a reassignment
-	reassigner.HandleNodeFailureNow("node2")
+	// Trigger a reassignment for a node that has partitions
+	reassigner.HandleNodeFailureNow(failNode)
 
 	// Gather metrics
 	mfs, err := registry.Gather()

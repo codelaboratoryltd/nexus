@@ -216,6 +216,55 @@ func (m *mockAllocationStore) AssignBackupNode(ctx context.Context, poolID, subs
 	return nil
 }
 
+func (m *mockAllocationStore) RenewAllocation(ctx context.Context, poolID, subscriberID string, newTTL int64) (*store.Allocation, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	alloc, ok := m.allocations[subscriberID]
+	if !ok || alloc.PoolID != poolID {
+		return nil, store.ErrNoAllocationFound
+	}
+	if newTTL > 0 {
+		alloc.TTL = newTTL
+	}
+	alloc.Epoch = 1
+	return alloc, nil
+}
+
+func (m *mockAllocationStore) ListExpiringAllocations(ctx context.Context, before time.Time) ([]*store.Allocation, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return []*store.Allocation{}, nil
+}
+
+func (m *mockAllocationStore) CleanupExpiredAllocations(ctx context.Context) (int, error) {
+	if m.err != nil {
+		return 0, m.err
+	}
+	return 0, nil
+}
+
+func (m *mockAllocationStore) GetCurrentEpoch() uint64 {
+	return 1
+}
+
+func (m *mockAllocationStore) AdvanceEpoch() uint64 {
+	return 1
+}
+
+func (m *mockAllocationStore) SetEpochPeriod(d time.Duration) {}
+
+func (m *mockAllocationStore) SetGracePeriod(epochs uint64) {}
+
+func (m *mockAllocationStore) GetEpochPeriod() time.Duration {
+	return time.Hour
+}
+
+func (m *mockAllocationStore) GetGracePeriod() uint64 {
+	return 2
+}
+
 // Test setup helpers
 
 func setupTestServer() (*Server, *mockPoolStore, *mockNodeStore, *mockAllocationStore) {

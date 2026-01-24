@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/codelaboratoryltd/nexus/internal/resource"
 
@@ -24,6 +25,20 @@ type AllocationStore interface {
 	ListBackupAllocationsByNode(ctx context.Context, nodeID string) ([]*Allocation, error)
 	ListAllocationsByNode(ctx context.Context, nodeID string) ([]*Allocation, error)
 	AssignBackupNode(ctx context.Context, poolID, subscriberID, backupNodeID string) error
+
+	// Epoch-based allocation methods (Demo F - WiFi mode)
+	// Uses epoch-based expiration: allocations expire when Epoch < currentEpoch - gracePeriod
+	RenewAllocation(ctx context.Context, poolID, subscriberID string, newTTL int64) (*Allocation, error)
+	ListExpiringAllocations(ctx context.Context, before time.Time) ([]*Allocation, error)
+	CleanupExpiredAllocations(ctx context.Context) (int, error)
+
+	// Epoch management
+	GetCurrentEpoch() uint64
+	AdvanceEpoch() uint64
+	SetEpochPeriod(d time.Duration)
+	SetGracePeriod(epochs uint64)
+	GetEpochPeriod() time.Duration
+	GetGracePeriod() uint64
 }
 
 // PoolStore manages resource pools.

@@ -16,8 +16,10 @@ import (
 type AllocationRequest struct {
 	PoolID       string `json:"pool_id"`
 	SubscriberID string `json:"subscriber_id"`
-	IP           string `json:"ip,omitempty"`      // Optional: specify IP or let system allocate
-	NodeID       string `json:"node_id,omitempty"` // Optional: primary node that owns this allocation
+	IP           string `json:"ip,omitempty"`         // Optional: specify IP or let system allocate
+	NodeID       string `json:"node_id,omitempty"`    // Optional: primary node that owns this allocation
+	TTL          int64  `json:"ttl,omitempty"`        // Optional: TTL in seconds (0 = permanent)
+	AllocType    string `json:"alloc_type,omitempty"` // Optional: "session", "sticky", "permanent"
 }
 
 // AllocationResponse represents an allocation in API responses.
@@ -29,6 +31,16 @@ type AllocationResponse struct {
 	NodeID       string    `json:"node_id,omitempty"`
 	BackupNodeID string    `json:"backup_node_id,omitempty"`
 	IsBackup     bool      `json:"is_backup,omitempty"`
+	TTL          int64     `json:"ttl,omitempty"`
+	Epoch        uint64    `json:"epoch,omitempty"`      // Epoch when allocation was created/renewed
+	ExpiresAt    time.Time `json:"expires_at,omitempty"` // Approximate expiration (informational)
+	LastRenewed  time.Time `json:"last_renewed,omitempty"`
+	AllocType    string    `json:"alloc_type,omitempty"`
+}
+
+// RenewAllocationRequest represents a request to renew an allocation's TTL.
+type RenewAllocationRequest struct {
+	TTL int64 `json:"ttl,omitempty"` // New TTL in seconds (0 = use original TTL)
 }
 
 // BackupAllocationRequest represents a request to create backup allocations.
@@ -132,12 +144,27 @@ func (s *Server) createAllocation(w http.ResponseWriter, r *http.Request) {
 		ip = allocatedIP
 	}
 
+	now := time.Now()
 	allocation := &store.Allocation{
 		PoolID:       req.PoolID,
 		SubscriberID: req.SubscriberID,
 		IP:           ip,
-		Timestamp:    time.Now(),
+		Timestamp:    now,
 		NodeID:       req.NodeID,
+	}
+
+	// Set TTL fields if provided (epoch-based expiration)
+	if req.TTL > 0 {
+		allocation.TTL = req.TTL
+		allocation.Epoch = s.allocStore.GetCurrentEpoch() // Set current epoch for expiration tracking
+		allocation.LastRenewed = now
+		// ExpiresAt is informational only - actual expiration is epoch-based
+		epochPeriod := s.allocStore.GetEpochPeriod()
+		gracePeriod := s.allocStore.GetGracePeriod()
+		allocation.ExpiresAt = now.Add(time.Duration(gracePeriod) * epochPeriod)
+	}
+	if req.AllocType != "" {
+		allocation.AllocType = store.AllocationType(req.AllocType)
 	}
 
 	if err := s.allocStore.SaveAllocation(ctx, allocation); err != nil {
@@ -218,6 +245,11 @@ func allocationToResponse(a *store.Allocation) AllocationResponse {
 		NodeID:       a.NodeID,
 		BackupNodeID: a.BackupNodeID,
 		IsBackup:     a.IsBackup,
+		TTL:          a.TTL,
+		Epoch:        a.Epoch,
+		ExpiresAt:    a.ExpiresAt,
+		LastRenewed:  a.LastRenewed,
+		AllocType:    string(a.AllocType),
 	}
 }
 
@@ -356,5 +388,80 @@ func (s *Server) listNodeAllocations(w http.ResponseWriter, r *http.Request) {
 		"allocations": response,
 		"count":       len(response),
 		"node_id":     nodeID,
+	})
+}
+
+// renewAllocation renews an allocation's TTL.
+// POST /api/v1/allocations/{subscriber_id}/renew
+func (s *Server) renewAllocation(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	vars := mux.Vars(r)
+	subscriberID := vars["subscriber_id"]
+
+	// Validate subscriber ID from URL
+	if err := validation.ValidateSubscriberID(subscriberID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req RenewAllocationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
+		return
+	}
+
+	// Find the allocation first to get pool ID
+	existing, err := s.allocStore.GetAllocationBySubscriber(ctx, subscriberID)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "allocation not found")
+		return
+	}
+
+	// Renew the allocation
+	renewed, err := s.allocStore.RenewAllocation(ctx, existing.PoolID, subscriberID, req.TTL)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, allocationToResponse(renewed))
+}
+
+// listExpiringAllocations returns allocations that expire before a given time.
+// GET /api/v1/allocations/expiring?within=3600
+func (s *Server) listExpiringAllocations(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Parse "within" parameter (seconds from now)
+	withinStr := r.URL.Query().Get("within")
+	if withinStr == "" {
+		withinStr = "3600" // Default to 1 hour
+	}
+
+	var withinSeconds int64
+	if _, err := json.Number(withinStr).Int64(); err == nil {
+		withinSeconds, _ = json.Number(withinStr).Int64()
+	} else {
+		respondError(w, http.StatusBadRequest, "invalid 'within' parameter: must be seconds")
+		return
+	}
+
+	before := time.Now().Add(time.Duration(withinSeconds) * time.Second)
+
+	allocations, err := s.allocStore.ListExpiringAllocations(ctx, before)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	response := make([]AllocationResponse, 0, len(allocations))
+	for _, a := range allocations {
+		response = append(response, allocationToResponse(a))
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"allocations":     response,
+		"count":           len(response),
+		"expiring_before": before,
 	})
 }
