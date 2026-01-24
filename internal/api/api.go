@@ -74,7 +74,10 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	if s.deviceStore != nil {
 		api.HandleFunc("/bootstrap", s.bootstrap).Methods("POST")
 		api.HandleFunc("/devices", s.listDevices).Methods("GET")
+		api.HandleFunc("/devices/import", s.importDevices).Methods("POST")
 		api.HandleFunc("/devices/{node_id}", s.getDevice).Methods("GET")
+		api.HandleFunc("/devices/{node_id}", s.assignDevice).Methods("PUT")
+		api.HandleFunc("/devices/{node_id}", s.deleteDevice).Methods("DELETE")
 	}
 }
 
