@@ -9,8 +9,12 @@ Nexus is the evolution of Neelix, providing distributed resource management and 
 ## Features
 
 - **Generic Resource Allocation**: IPs, VLANs, S-VLANs, ports
-- **Virtual Hashring**: Consistent resource distribution across nodes
-- **OLT Bootstrap**: Zero-touch provisioning for edge nodes
+- **Virtual Hashring**: Consistent resource distribution across nodes (Rendezvous hashing)
+- **TTL-Based Allocations**: Time-limited allocations with auto-expiration and renewal
+- **OLT Bootstrap**: Zero-touch provisioning for edge nodes (Bootstrap API)
+- **Failure Detection**: Automatic node failure detection with configurable thresholds
+- **Shard Reassignment**: Automatic resource redistribution on node failure
+- **Backup IP Pre-allocation**: HA failover with pre-allocated backup IPs
 - **Distributed State**: CLSet CRDT for eventual consistency
 - **Offline-First**: Edge nodes continue during partitions
 
@@ -33,6 +37,8 @@ go build -o nexus ./cmd/nexus
 
 ## API Endpoints
 
+### Core Resources
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
@@ -42,10 +48,37 @@ go build -o nexus ./cmd/nexus
 | `/api/v1/pools/{id}` | GET | Get pool details |
 | `/api/v1/pools/{id}` | DELETE | Delete pool |
 | `/api/v1/allocations` | GET | List allocations (requires pool_id) |
-| `/api/v1/allocations` | POST | Create allocation |
+| `/api/v1/allocations` | POST | Create allocation (supports TTL) |
 | `/api/v1/allocations/{subscriber_id}` | GET | Get subscriber allocation |
 | `/api/v1/allocations/{subscriber_id}` | DELETE | Delete allocation |
+| `/api/v1/allocations/{subscriber_id}/renew` | POST | Renew TTL allocation |
+| `/api/v1/allocations/expiring` | GET | List expiring allocations |
 | `/api/v1/nodes` | GET | List cluster nodes |
+
+### Bootstrap API (ZTP)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/bootstrap/register` | POST | Register new device |
+| `/api/v1/bootstrap/devices` | GET | List registered devices |
+| `/api/v1/bootstrap/devices/{id}` | GET | Get device details |
+| `/api/v1/bootstrap/devices/{id}/config` | GET | Get device configuration |
+
+### TTL Allocation Example
+
+```bash
+# Create allocation with 2-hour TTL
+curl -X POST http://localhost:9000/api/v1/allocations \
+  -H "Content-Type: application/json" \
+  -d '{"pool_id":"wifi","subscriber_id":"mac-aabbccdd","ttl":7200,"alloc_type":"sticky"}'
+
+# Renew allocation
+curl -X POST http://localhost:9000/api/v1/allocations/mac-aabbccdd/renew \
+  -d '{"ttl":7200}'
+
+# List allocations expiring within 1 hour
+curl "http://localhost:9000/api/v1/allocations/expiring?within=3600"
+```
 
 ## Ports
 
