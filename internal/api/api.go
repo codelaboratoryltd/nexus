@@ -63,12 +63,17 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 
 	// Nodes
 	api.HandleFunc("/nodes", s.listNodes).Methods("GET")
+	api.HandleFunc("/nodes/{node_id}/allocations", s.listNodeAllocations).Methods("GET")
+	api.HandleFunc("/nodes/{node_id}/backup-allocations", s.listBackupAllocations).Methods("GET")
 
 	// Allocations
 	api.HandleFunc("/allocations", s.listAllocations).Methods("GET")
 	api.HandleFunc("/allocations", s.createAllocation).Methods("POST")
 	api.HandleFunc("/allocations/{subscriber_id}", s.getAllocation).Methods("GET")
 	api.HandleFunc("/allocations/{subscriber_id}", s.deleteAllocation).Methods("DELETE")
+
+	// Backup Allocations
+	api.HandleFunc("/pools/{pool_id}/backup-allocations", s.createBackupAllocations).Methods("POST")
 
 	// Bootstrap (device registration)
 	if s.deviceStore != nil {

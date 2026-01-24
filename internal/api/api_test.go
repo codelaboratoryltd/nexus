@@ -178,6 +178,44 @@ func (m *mockAllocationStore) CountAllocationsByPool(ctx context.Context, poolID
 	return count, nil
 }
 
+func (m *mockAllocationStore) ListBackupAllocationsByNode(ctx context.Context, nodeID string) ([]*store.Allocation, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	allocs := make([]*store.Allocation, 0)
+	for _, a := range m.allocations {
+		if a.BackupNodeID == nodeID {
+			allocs = append(allocs, a)
+		}
+	}
+	return allocs, nil
+}
+
+func (m *mockAllocationStore) ListAllocationsByNode(ctx context.Context, nodeID string) ([]*store.Allocation, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	allocs := make([]*store.Allocation, 0)
+	for _, a := range m.allocations {
+		if a.NodeID == nodeID {
+			allocs = append(allocs, a)
+		}
+	}
+	return allocs, nil
+}
+
+func (m *mockAllocationStore) AssignBackupNode(ctx context.Context, poolID, subscriberID, backupNodeID string) error {
+	if m.err != nil {
+		return m.err
+	}
+	alloc, ok := m.allocations[subscriberID]
+	if !ok || alloc.PoolID != poolID {
+		return store.ErrNoAllocationFound
+	}
+	alloc.BackupNodeID = backupNodeID
+	return nil
+}
+
 // Test setup helpers
 
 func setupTestServer() (*Server, *mockPoolStore, *mockNodeStore, *mockAllocationStore) {
@@ -939,5 +977,349 @@ func TestCreatePool_WithAllFields(t *testing.T) {
 	}
 	if len(response.Exclusions) != 1 {
 		t.Errorf("createPool Exclusions length = %d, want 1", len(response.Exclusions))
+	}
+}
+
+// Tests for Backup IP Pre-allocation Feature
+
+func TestCreatePool_WithBackupRatio(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+	router := setupTestRouter(server)
+
+	body := `{
+		"id": "pool1",
+		"cidr": "192.168.0.0/24",
+		"prefix": 28,
+		"backup_ratio": 0.1
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/pools", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("createPool returned status %d, want %d: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	var response PoolResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if response.BackupRatio != 0.1 {
+		t.Errorf("createPool BackupRatio = %f, want 0.1", response.BackupRatio)
+	}
+}
+
+func TestCreatePool_InvalidBackupRatio(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+	router := setupTestRouter(server)
+
+	body := `{
+		"id": "pool1",
+		"cidr": "192.168.0.0/24",
+		"prefix": 28,
+		"backup_ratio": 1.5
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/pools", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("createPool with invalid backup_ratio returned status %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateAllocation_WithNodeID(t *testing.T) {
+	server, poolStore, _, _ := setupTestServer()
+	router := setupTestRouter(server)
+
+	// Add a pool first
+	_, cidr, _ := net.ParseCIDR("192.168.0.0/24")
+	poolStore.pools["pool1"] = &store.Pool{
+		ID:     "pool1",
+		CIDR:   *cidr,
+		Prefix: 28,
+	}
+	server.ring.AddPool("pool1", cidr)
+
+	body := `{"pool_id": "pool1", "subscriber_id": "sub1", "node_id": "bng-node-1"}`
+	req := httptest.NewRequest("POST", "/api/v1/allocations", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("createAllocation returned status %d, want %d: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	var response AllocationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if response.NodeID != "bng-node-1" {
+		t.Errorf("createAllocation NodeID = %s, want bng-node-1", response.NodeID)
+	}
+}
+
+func TestCreateAllocation_InvalidNodeID(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+	router := setupTestRouter(server)
+
+	body := `{"pool_id": "pool1", "subscriber_id": "sub1", "node_id": "invalid--node"}`
+	req := httptest.NewRequest("POST", "/api/v1/allocations", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("createAllocation with invalid node_id returned status %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateBackupAllocations_Success(t *testing.T) {
+	server, poolStore, _, allocStore := setupTestServer()
+	router := setupTestRouter(server)
+
+	// Add a pool with backup ratio
+	_, cidr, _ := net.ParseCIDR("192.168.0.0/24")
+	poolStore.pools["pool1"] = &store.Pool{
+		ID:          "pool1",
+		CIDR:        *cidr,
+		Prefix:      28,
+		BackupRatio: 0.5,
+	}
+
+	// Add some allocations owned by bng-node-1
+	allocStore.allocations["sub1"] = &store.Allocation{
+		PoolID:       "pool1",
+		SubscriberID: "sub1",
+		IP:           net.ParseIP("192.168.0.1"),
+		Timestamp:    time.Now(),
+		NodeID:       "bng-node-1",
+	}
+	allocStore.allocations["sub2"] = &store.Allocation{
+		PoolID:       "pool1",
+		SubscriberID: "sub2",
+		IP:           net.ParseIP("192.168.0.2"),
+		Timestamp:    time.Now(),
+		NodeID:       "bng-node-1",
+	}
+
+	body := `{"backup_node_id": "bng-node-2"}`
+	req := httptest.NewRequest("POST", "/api/v1/pools/pool1/backup-allocations", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("createBackupAllocations returned status %d, want %d: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	var response BackupAllocationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if response.BackupNodeID != "bng-node-2" {
+		t.Errorf("createBackupAllocations BackupNodeID = %s, want bng-node-2", response.BackupNodeID)
+	}
+	// With 50% backup ratio and 2 allocations, we should assign 1 backup
+	if response.AllocationsCount != 1 {
+		t.Errorf("createBackupAllocations AllocationsCount = %d, want 1", response.AllocationsCount)
+	}
+}
+
+func TestCreateBackupAllocations_InvalidBackupNodeID(t *testing.T) {
+	server, poolStore, _, _ := setupTestServer()
+	router := setupTestRouter(server)
+
+	// Add a pool
+	_, cidr, _ := net.ParseCIDR("192.168.0.0/24")
+	poolStore.pools["pool1"] = &store.Pool{
+		ID:     "pool1",
+		CIDR:   *cidr,
+		Prefix: 28,
+	}
+
+	body := `{"backup_node_id": ""}`
+	req := httptest.NewRequest("POST", "/api/v1/pools/pool1/backup-allocations", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("createBackupAllocations with empty backup_node_id returned status %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCreateBackupAllocations_PoolNotFound(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+	router := setupTestRouter(server)
+
+	body := `{"backup_node_id": "bng-node-2"}`
+	req := httptest.NewRequest("POST", "/api/v1/pools/nonexistent/backup-allocations", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("createBackupAllocations for nonexistent pool returned status %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestListBackupAllocations_Success(t *testing.T) {
+	server, _, _, allocStore := setupTestServer()
+	router := setupTestRouter(server)
+
+	// Add an allocation with a backup node
+	allocStore.allocations["sub1"] = &store.Allocation{
+		PoolID:       "pool1",
+		SubscriberID: "sub1",
+		IP:           net.ParseIP("192.168.0.1"),
+		Timestamp:    time.Now(),
+		NodeID:       "bng-node-1",
+		BackupNodeID: "bng-node-2",
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/nodes/bng-node-2/backup-allocations", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("listBackupAllocations returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	count, ok := response["count"].(float64)
+	if !ok || count != 1 {
+		t.Errorf("Expected count 1, got %v", response["count"])
+	}
+
+	backupNodeID, ok := response["backup_node_id"].(string)
+	if !ok || backupNodeID != "bng-node-2" {
+		t.Errorf("Expected backup_node_id bng-node-2, got %v", response["backup_node_id"])
+	}
+}
+
+func TestListBackupAllocations_InvalidNodeID(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+	router := setupTestRouter(server)
+
+	req := httptest.NewRequest("GET", "/api/v1/nodes/--invalid/backup-allocations", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("listBackupAllocations with invalid node_id returned status %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestListNodeAllocations_Success(t *testing.T) {
+	server, _, _, allocStore := setupTestServer()
+	router := setupTestRouter(server)
+
+	// Add allocations owned by bng-node-1
+	allocStore.allocations["sub1"] = &store.Allocation{
+		PoolID:       "pool1",
+		SubscriberID: "sub1",
+		IP:           net.ParseIP("192.168.0.1"),
+		Timestamp:    time.Now(),
+		NodeID:       "bng-node-1",
+	}
+	allocStore.allocations["sub2"] = &store.Allocation{
+		PoolID:       "pool1",
+		SubscriberID: "sub2",
+		IP:           net.ParseIP("192.168.0.2"),
+		Timestamp:    time.Now(),
+		NodeID:       "bng-node-1",
+	}
+	// Add an allocation owned by a different node
+	allocStore.allocations["sub3"] = &store.Allocation{
+		PoolID:       "pool1",
+		SubscriberID: "sub3",
+		IP:           net.ParseIP("192.168.0.3"),
+		Timestamp:    time.Now(),
+		NodeID:       "bng-node-2",
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/nodes/bng-node-1/allocations", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("listNodeAllocations returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	count, ok := response["count"].(float64)
+	if !ok || count != 2 {
+		t.Errorf("Expected count 2, got %v", response["count"])
+	}
+
+	nodeID, ok := response["node_id"].(string)
+	if !ok || nodeID != "bng-node-1" {
+		t.Errorf("Expected node_id bng-node-1, got %v", response["node_id"])
+	}
+}
+
+func TestAllocationToResponse_WithBackupFields(t *testing.T) {
+	timestamp := time.Now()
+	alloc := &store.Allocation{
+		PoolID:       "pool1",
+		SubscriberID: "sub1",
+		IP:           net.ParseIP("192.168.0.1"),
+		Timestamp:    timestamp,
+		NodeID:       "bng-node-1",
+		BackupNodeID: "bng-node-2",
+		IsBackup:     false,
+	}
+
+	response := allocationToResponse(alloc)
+
+	if response.NodeID != "bng-node-1" {
+		t.Errorf("allocationToResponse NodeID = %s, want bng-node-1", response.NodeID)
+	}
+	if response.BackupNodeID != "bng-node-2" {
+		t.Errorf("allocationToResponse BackupNodeID = %s, want bng-node-2", response.BackupNodeID)
+	}
+	if response.IsBackup != false {
+		t.Errorf("allocationToResponse IsBackup = %v, want false", response.IsBackup)
+	}
+}
+
+func TestPoolToResponse_WithBackupRatio(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("192.168.0.0/24")
+	pool := &store.Pool{
+		ID:          "pool1",
+		CIDR:        *cidr,
+		Prefix:      28,
+		BackupRatio: 0.15,
+	}
+
+	response := poolToResponse(pool)
+
+	if response.BackupRatio != 0.15 {
+		t.Errorf("poolToResponse BackupRatio = %f, want 0.15", response.BackupRatio)
 	}
 }

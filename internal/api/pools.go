@@ -18,6 +18,7 @@ type PoolRequest struct {
 	Exclusions     []string          `json:"exclusions"`
 	Metadata       map[string]string `json:"metadata"`
 	ShardingFactor int               `json:"sharding_factor"`
+	BackupRatio    float64           `json:"backup_ratio"` // 0.0-1.0, percentage of pool reserved for backup allocations
 }
 
 // PoolResponse represents a pool in API responses.
@@ -28,6 +29,7 @@ type PoolResponse struct {
 	Exclusions     []string          `json:"exclusions"`
 	Metadata       map[string]string `json:"metadata"`
 	ShardingFactor int               `json:"sharding_factor"`
+	BackupRatio    float64           `json:"backup_ratio"`
 }
 
 // listPools returns all pools.
@@ -100,6 +102,12 @@ func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate backup ratio
+	if err := validation.ValidateBackupRatio(req.BackupRatio); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	pool := &store.Pool{
 		ID:             req.ID,
 		CIDR:           *ipNet,
@@ -107,6 +115,7 @@ func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 		Exclusions:     req.Exclusions,
 		Metadata:       req.Metadata,
 		ShardingFactor: req.ShardingFactor,
+		BackupRatio:    req.BackupRatio,
 	}
 
 	if err := pool.Validate(); err != nil {
@@ -178,5 +187,6 @@ func poolToResponse(p *store.Pool) PoolResponse {
 		Exclusions:     p.Exclusions,
 		Metadata:       p.Metadata,
 		ShardingFactor: p.ShardingFactor,
+		BackupRatio:    p.BackupRatio,
 	}
 }

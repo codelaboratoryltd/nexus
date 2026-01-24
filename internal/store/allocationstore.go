@@ -9,6 +9,7 @@ import (
 
 	"github.com/codelaboratoryltd/nexus/internal/resource"
 	"github.com/codelaboratoryltd/nexus/internal/util"
+	"github.com/fxamacker/cbor/v2"
 
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
@@ -20,6 +21,8 @@ type allocationStore struct {
 	poolStore            PoolStore
 	poolAllocationPrefix ds.Key
 	subscriberPrefix     ds.Key
+	nodePrefix           ds.Key
+	backupNodePrefix     ds.Key
 }
 
 // NewAllocationStore creates a new allocation store.
@@ -29,6 +32,8 @@ func NewAllocationStore(store ds.Batching, poolAllocationPrefix, subscriberPrefi
 		poolStore:            poolstore,
 		poolAllocationPrefix: poolAllocationPrefix,
 		subscriberPrefix:     subscriberPrefix,
+		nodePrefix:           ds.NewKey("/node"),
+		backupNodePrefix:     ds.NewKey("/backup-node"),
 	}
 }
 
@@ -56,8 +61,17 @@ func (as *allocationStore) SaveAllocation(ctx context.Context, a *Allocation) er
 	allocationKey := as.poolAllocationPrefix.ChildString(a.PoolID).ChildString(a.SubscriberID).ChildString(offsetBase64)
 	subscriberKey := as.subscriberPrefix.ChildString(a.SubscriberID).ChildString(a.PoolID).ChildString(offsetBase64)
 
-	// Serialize timestamp as raw bytes
-	timestampBytes := util.MarshalTime(a.Timestamp)
+	// Serialize allocation value with CBOR
+	allocValue := &AllocationValue{
+		Timestamp:    a.Timestamp,
+		NodeID:       a.NodeID,
+		BackupNodeID: a.BackupNodeID,
+		IsBackup:     a.IsBackup,
+	}
+	valueBytes, err := cbor.Marshal(allocValue)
+	if err != nil {
+		return fmt.Errorf("failed to marshal allocation value: %w", err)
+	}
 
 	// Use batch to persist both entries
 	b, err := as.store.Batch(ctx)
@@ -66,13 +80,29 @@ func (as *allocationStore) SaveAllocation(ctx context.Context, a *Allocation) er
 	}
 
 	// Store the allocation
-	if err := b.Put(ctx, allocationKey, timestampBytes); err != nil {
+	if err := b.Put(ctx, allocationKey, valueBytes); err != nil {
 		return fmt.Errorf("failed to persist allocation: %w", err)
 	}
 
 	// Store the subscriber index
-	if err := b.Put(ctx, subscriberKey, timestampBytes); err != nil {
+	if err := b.Put(ctx, subscriberKey, valueBytes); err != nil {
 		return fmt.Errorf("failed to update subscriber index: %w", err)
+	}
+
+	// Store node index if node ID is provided
+	if a.NodeID != "" {
+		nodeKey := as.nodePrefix.ChildString(a.NodeID).ChildString(a.PoolID).ChildString(a.SubscriberID).ChildString(offsetBase64)
+		if err := b.Put(ctx, nodeKey, valueBytes); err != nil {
+			return fmt.Errorf("failed to update node index: %w", err)
+		}
+	}
+
+	// Store backup node index if backup node ID is provided
+	if a.BackupNodeID != "" {
+		backupNodeKey := as.backupNodePrefix.ChildString(a.BackupNodeID).ChildString(a.PoolID).ChildString(a.SubscriberID).ChildString(offsetBase64)
+		if err := b.Put(ctx, backupNodeKey, valueBytes); err != nil {
+			return fmt.Errorf("failed to update backup node index: %w", err)
+		}
 	}
 
 	// Commit the batch
@@ -313,4 +343,126 @@ func (as *allocationStore) CountAllocationsByPool(ctx context.Context, poolID st
 		count++
 	}
 	return count, nil
+}
+
+// ListBackupAllocationsByNode returns all allocations where the given node is the backup.
+func (as *allocationStore) ListBackupAllocationsByNode(ctx context.Context, nodeID string) ([]*Allocation, error) {
+	q := query.Query{Prefix: as.backupNodePrefix.ChildString(nodeID).String()}
+	results, err := as.store.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query backup allocations: %w", err)
+	}
+	defer results.Close()
+
+	var allocs []*Allocation
+	for result := range results.Next() {
+		if result.Value == nil {
+			continue
+		}
+		key := ds.RawKey(result.Key)
+		ar, err := as.unmarshalNodeKey(key)
+		if err != nil {
+			if errors.Is(err, ErrMalformedKey) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to unmarshal backup node key: %w", err)
+		}
+
+		p, err := as.poolStore.GetPool(ctx, ar.PoolID)
+		if err != nil {
+			continue // Skip allocations for pools that no longer exist
+		}
+
+		a, err := ar.GetAllocation(p, result.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get allocation: %w", err)
+		}
+
+		allocs = append(allocs, a)
+	}
+	return allocs, nil
+}
+
+// ListAllocationsByNode returns all allocations where the given node is the primary owner.
+func (as *allocationStore) ListAllocationsByNode(ctx context.Context, nodeID string) ([]*Allocation, error) {
+	q := query.Query{Prefix: as.nodePrefix.ChildString(nodeID).String()}
+	results, err := as.store.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query node allocations: %w", err)
+	}
+	defer results.Close()
+
+	var allocs []*Allocation
+	for result := range results.Next() {
+		if result.Value == nil {
+			continue
+		}
+		key := ds.RawKey(result.Key)
+		ar, err := as.unmarshalNodeKey(key)
+		if err != nil {
+			if errors.Is(err, ErrMalformedKey) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to unmarshal node key: %w", err)
+		}
+
+		p, err := as.poolStore.GetPool(ctx, ar.PoolID)
+		if err != nil {
+			continue // Skip allocations for pools that no longer exist
+		}
+
+		a, err := ar.GetAllocation(p, result.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get allocation: %w", err)
+		}
+
+		allocs = append(allocs, a)
+	}
+	return allocs, nil
+}
+
+// AssignBackupNode assigns a backup node to an existing allocation.
+func (as *allocationStore) AssignBackupNode(ctx context.Context, poolID, subscriberID, backupNodeID string) error {
+	// Get the existing allocation
+	alloc, err := as.GetAllocation(ctx, poolID, subscriberID)
+	if err != nil {
+		return fmt.Errorf("failed to get allocation: %w", err)
+	}
+
+	// Update the backup node
+	alloc.BackupNodeID = backupNodeID
+
+	// Re-save the allocation with the updated backup node
+	if err := as.SaveAllocation(ctx, alloc); err != nil {
+		return fmt.Errorf("failed to save allocation with backup node: %w", err)
+	}
+
+	return nil
+}
+
+// unmarshalNodeKey unmarshals an allocation key from a node index key.
+// Expected format: /node/{nodeID}/{poolID}/{subscriberID}/{offset} or /backup-node/{nodeID}/{poolID}/{subscriberID}/{offset}
+func (as *allocationStore) unmarshalNodeKey(key ds.Key) (*AllocationKey, error) {
+	parts := key.Namespaces()
+	lenparts := len(parts)
+	// Expected format: /node/node1/pool1/sub1/AQ or /backup-node/node1/pool1/sub1/AQ
+	const canonicalNsNmb = 5
+	if lenparts < canonicalNsNmb {
+		return nil, ErrMalformedKey
+	}
+	poolID := parts[lenparts-3]
+	subscriberID := parts[lenparts-2]
+	offsetBase64 := parts[lenparts-1]
+
+	// Decode offset from base64
+	offsetBytes, err := base64.RawURLEncoding.DecodeString(offsetBase64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode offset: %w", err)
+	}
+
+	return &AllocationKey{
+		PoolID:       poolID,
+		IPOffset:     new(big.Int).SetBytes(offsetBytes),
+		SubscriberID: subscriberID,
+	}, nil
 }

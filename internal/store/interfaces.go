@@ -19,6 +19,11 @@ type AllocationStore interface {
 	UnmarshalSubscriberKey(key ds.Key, subscriberID string) (*AllocationKey, error)
 	ListAllocationsByPool(ctx context.Context, poolID string) (allocs []*Allocation, err error)
 	CountAllocationsByPool(ctx context.Context, poolID string) (int, error)
+
+	// Backup allocation methods for failover support
+	ListBackupAllocationsByNode(ctx context.Context, nodeID string) ([]*Allocation, error)
+	ListAllocationsByNode(ctx context.Context, nodeID string) ([]*Allocation, error)
+	AssignBackupNode(ctx context.Context, poolID, subscriberID, backupNodeID string) error
 }
 
 // PoolStore manages resource pools.
