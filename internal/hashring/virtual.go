@@ -90,18 +90,20 @@ func (r *VirtualHashRing) updateVirtualHashRing() {
 	}
 
 	orderedNodes := sorted(r.nodes)
-	numNodes := len(orderedNodes)
 
 	virtualNodesPlacement := NewVirtualHashMapping()
 	for nodeID := range r.nodes {
 		virtualNodesPlacement.AddNode(nodeID)
 	}
 
+	// Use Rendezvous hashing for minimal VNode disruption on node changes.
+	// When a node is removed, only vnodes assigned to that node are redistributed.
+	// When a node is added, only ~1/N vnodes move to the new node.
 	for poolID, poolHashRing := range r.poolsHashRings {
 		for virtualNodeID, virtualNodeOrdinal := range poolHashRing.GetHashOrders() {
-			nodeIndex := virtualNodeOrdinal % numNodes
-			nodeID := orderedNodes[nodeIndex]
-			virtualNodesPlacement.Link(nodeID, poolID, VirtualNodeID(virtualNodeID))
+			// Use Rendezvous Hash to select node based on (vnode, nodes) combination
+			selectedNode := RendezvousHash(uint64(virtualNodeOrdinal), orderedNodes)
+			virtualNodesPlacement.Link(selectedNode, poolID, VirtualNodeID(virtualNodeID))
 		}
 	}
 
@@ -377,15 +379,6 @@ func (r *VirtualHashRing) AllocateIP(poolID string, subscriberID string) net.IP 
 	}
 
 	return nil
-}
-
-// hashString creates a hash from a string for consistent allocation
-func hashString(s string) uint64 {
-	var hash uint64 = 5381
-	for _, c := range s {
-		hash = ((hash << 5) + hash) + uint64(c)
-	}
-	return hash
 }
 
 // ipFromSubnetAndHash generates a deterministic IP within a subnet
