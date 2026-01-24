@@ -89,6 +89,10 @@ var (
 	// Formats: GPON123456, ABCD12345678, etc.
 	serialNumberPattern = regexp.MustCompile(`^[A-Z0-9]{4,32}$`)
 
+	// siteIDPattern allows alphanumeric characters, hyphens, underscores
+	// Formats: london-1, site_001, datacenter-east-1, etc.
+	siteIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
+
 	// macAddressPattern matches MAC addresses in various formats
 	// Supports: 00:11:22:33:44:55, 00-11-22-33-44-55, 001122334455
 	macAddressPattern = regexp.MustCompile(`^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{12})$`)
@@ -268,6 +272,27 @@ func ValidateSerialNumber(serial string) error {
 
 	if err := checkDangerousInput(serial); err != nil {
 		return NewValidationError("serial_number", serial, "serial number contains potentially dangerous characters", err)
+	}
+
+	return nil
+}
+
+// ValidateSiteID validates a site identifier
+func ValidateSiteID(siteID string) error {
+	if siteID == "" {
+		return NewValidationError("site_id", siteID, "site ID is required", ErrEmptyValue)
+	}
+
+	if len(siteID) > 64 {
+		return NewValidationError("site_id", siteID, "site ID exceeds maximum length of 64", ErrValueTooLong)
+	}
+
+	if !siteIDPattern.MatchString(siteID) {
+		return NewValidationError("site_id", siteID, "site ID must contain only alphanumeric characters, hyphens, and underscores", ErrInvalidFormat)
+	}
+
+	if err := checkDangerousInput(siteID); err != nil {
+		return NewValidationError("site_id", siteID, "site ID contains potentially dangerous characters", err)
 	}
 
 	return nil

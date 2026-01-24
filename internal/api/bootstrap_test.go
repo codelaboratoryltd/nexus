@@ -678,3 +678,744 @@ func TestBootstrap_LongPublicKey(t *testing.T) {
 		t.Errorf("bootstrap with long public_key returned status %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
+
+// ========================================================================
+// Site Assignment Tests
+// ========================================================================
+
+func TestAssignDevice_EmptySite_BecomesActive(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Register a device
+	body := `{
+		"serial": "GPON12345678",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("bootstrap returned status %d: %s", w.Code, w.Body.String())
+	}
+
+	var bootstrapResp BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &bootstrapResp)
+
+	// Assign device to a site
+	assignBody := `{"site_id": "london-1"}`
+	req = httptest.NewRequest("PUT", "/api/v1/devices/"+bootstrapResp.NodeID, strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("assign device returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response AssignDeviceResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if response.Role != "active" {
+		t.Errorf("role = %s, want active", response.Role)
+	}
+	if response.Status != "configured" {
+		t.Errorf("status = %s, want configured", response.Status)
+	}
+	if response.SiteID != "london-1" {
+		t.Errorf("site_id = %s, want london-1", response.SiteID)
+	}
+	if response.PartnerNodeID != "" {
+		t.Errorf("partner_node_id should be empty, got %s", response.PartnerNodeID)
+	}
+}
+
+func TestAssignDevice_SecondDevice_BecomesStandbyAndPairs(t *testing.T) {
+	server, _, _, _, deviceStore := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Register first device
+	body := `{
+		"serial": "GPON11111111",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var firstBootstrap BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &firstBootstrap)
+
+	// Register second device
+	body = `{
+		"serial": "GPON22222222",
+		"mac": "00:11:22:33:44:66"
+	}`
+	req = httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var secondBootstrap BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &secondBootstrap)
+
+	// Assign first device to site
+	assignBody := `{"site_id": "london-1"}`
+	req = httptest.NewRequest("PUT", "/api/v1/devices/"+firstBootstrap.NodeID, strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("first assign returned status %d: %s", w.Code, w.Body.String())
+	}
+
+	// Assign second device to same site
+	req = httptest.NewRequest("PUT", "/api/v1/devices/"+secondBootstrap.NodeID, strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("second assign returned status %d: %s", w.Code, w.Body.String())
+	}
+
+	var response AssignDeviceResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	// Second device should be standby
+	if response.Role != "standby" {
+		t.Errorf("role = %s, want standby", response.Role)
+	}
+	if response.PartnerNodeID != firstBootstrap.NodeID {
+		t.Errorf("partner_node_id = %s, want %s", response.PartnerNodeID, firstBootstrap.NodeID)
+	}
+
+	// Verify first device now has partner set
+	firstDevice, err := deviceStore.GetDevice(nil, firstBootstrap.NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get first device: %v", err)
+	}
+	if firstDevice.PartnerNodeID != secondBootstrap.NodeID {
+		t.Errorf("first device partner_node_id = %s, want %s", firstDevice.PartnerNodeID, secondBootstrap.NodeID)
+	}
+	if firstDevice.Role != store.DeviceRoleActive {
+		t.Errorf("first device role = %s, want active", firstDevice.Role)
+	}
+}
+
+func TestAssignDevice_ThirdDevice_Error(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Register and assign three devices to same site
+	serials := []string{"GPON11111111", "GPON22222222", "GPON33333333"}
+	macs := []string{"00:11:22:33:44:55", "00:11:22:33:44:66", "00:11:22:33:44:77"}
+	var nodeIDs []string
+
+	for i := 0; i < 3; i++ {
+		body := `{
+			"serial": "` + serials[i] + `",
+			"mac": "` + macs[i] + `"
+		}`
+		req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		var resp BootstrapResponse
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		nodeIDs = append(nodeIDs, resp.NodeID)
+	}
+
+	// Assign first two devices (should succeed)
+	assignBody := `{"site_id": "london-1"}`
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("PUT", "/api/v1/devices/"+nodeIDs[i], strings.NewReader(assignBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("assign device %d returned status %d: %s", i, w.Code, w.Body.String())
+		}
+	}
+
+	// Assign third device (should fail)
+	req := httptest.NewRequest("PUT", "/api/v1/devices/"+nodeIDs[2], strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("third device assign returned status %d, want %d: %s", w.Code, http.StatusConflict, w.Body.String())
+	}
+}
+
+func TestAssignDevice_NotFound(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	assignBody := `{"site_id": "london-1"}`
+	req := httptest.NewRequest("PUT", "/api/v1/devices/nonexistent-node", strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("assign nonexistent device returned status %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestAssignDevice_InvalidSiteID(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Register a device
+	body := `{
+		"serial": "GPON12345678",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var bootstrapResp BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &bootstrapResp)
+
+	testCases := []struct {
+		name   string
+		siteID string
+	}{
+		{"empty", ""},
+		{"special chars", "london@1"},
+		{"too long", strings.Repeat("x", 65)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assignBody := `{"site_id": "` + tc.siteID + `"}`
+			req := httptest.NewRequest("PUT", "/api/v1/devices/"+bootstrapResp.NodeID, strings.NewReader(assignBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			router.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("assign with invalid site_id returned status %d, want %d", w.Code, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
+func TestAssignDevice_ReassignToSameSite(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Register a device
+	body := `{
+		"serial": "GPON12345678",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var bootstrapResp BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &bootstrapResp)
+
+	// Assign device to site
+	assignBody := `{"site_id": "london-1"}`
+	req = httptest.NewRequest("PUT", "/api/v1/devices/"+bootstrapResp.NodeID, strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// Reassign same device to same site (should succeed, idempotent)
+	req = httptest.NewRequest("PUT", "/api/v1/devices/"+bootstrapResp.NodeID, strings.NewReader(assignBody))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("reassign to same site returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response AssignDeviceResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	if response.Role != "active" {
+		t.Errorf("role = %s, want active", response.Role)
+	}
+}
+
+// ========================================================================
+// Bootstrap After Configuration Tests
+// ========================================================================
+
+func TestBootstrap_AfterConfiguration_ReturnsFullConfig(t *testing.T) {
+	server, _, _, _, deviceStore := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Register first device
+	body := `{
+		"serial": "GPON11111111",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var firstBootstrap BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &firstBootstrap)
+
+	// Register second device
+	body = `{
+		"serial": "GPON22222222",
+		"mac": "00:11:22:33:44:66"
+	}`
+	req = httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var secondBootstrap BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &secondBootstrap)
+
+	// Assign both devices to same site
+	assignBody := `{"site_id": "london-1"}`
+	for _, nodeID := range []string{firstBootstrap.NodeID, secondBootstrap.NodeID} {
+		req = httptest.NewRequest("PUT", "/api/v1/devices/"+nodeID, strings.NewReader(assignBody))
+		req.Header.Set("Content-Type", "application/json")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+	}
+
+	// Add pools to first device
+	device, _ := deviceStore.GetDevice(nil, firstBootstrap.NodeID)
+	device.AssignedPools = []string{"pool-1"}
+	deviceStore.SaveDevice(nil, device)
+
+	// Now bootstrap the first device again
+	body = `{
+		"serial": "GPON11111111",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req = httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("bootstrap configured device returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	if response.Status != "configured" {
+		t.Errorf("status = %s, want configured", response.Status)
+	}
+	if response.SiteID != "london-1" {
+		t.Errorf("site_id = %s, want london-1", response.SiteID)
+	}
+	if response.Role != "active" {
+		t.Errorf("role = %s, want active", response.Role)
+	}
+	if response.Partner == nil {
+		t.Error("partner should not be nil")
+	} else if response.Partner.NodeID != secondBootstrap.NodeID {
+		t.Errorf("partner.node_id = %s, want %s", response.Partner.NodeID, secondBootstrap.NodeID)
+	}
+	if response.RetryAfter != 0 {
+		t.Errorf("retry_after = %d, want 0", response.RetryAfter)
+	}
+}
+
+// ========================================================================
+// Bulk Import Tests
+// ========================================================================
+
+func TestImportDevices_CSV(t *testing.T) {
+	server, _, _, _, deviceStore := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Create CSV content
+	csvContent := `serial,site_id
+GPON11111111,london-1
+GPON22222222,london-1
+GPON33333333,paris-1`
+
+	req := httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(csvContent))
+	req.Header.Set("Content-Type", "text/csv")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("import returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response ImportResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if response.Imported != 3 {
+		t.Errorf("imported = %d, want 3", response.Imported)
+	}
+	if response.Paired != 1 {
+		t.Errorf("paired = %d, want 1 (second device at london-1)", response.Paired)
+	}
+	if len(response.Errors) != 0 {
+		t.Errorf("expected no errors, got: %v", response.Errors)
+	}
+
+	// Verify devices were created with correct roles
+	londonDevices, _ := deviceStore.ListDevicesBySite(nil, "london-1")
+	if len(londonDevices) != 2 {
+		t.Errorf("expected 2 devices at london-1, got %d", len(londonDevices))
+	}
+
+	// Check that one is active and one is standby
+	activeCount := 0
+	standbyCount := 0
+	for _, d := range londonDevices {
+		if d.Role == store.DeviceRoleActive {
+			activeCount++
+		} else if d.Role == store.DeviceRoleStandby {
+			standbyCount++
+		}
+	}
+	if activeCount != 1 {
+		t.Errorf("expected 1 active device, got %d", activeCount)
+	}
+	if standbyCount != 1 {
+		t.Errorf("expected 1 standby device, got %d", standbyCount)
+	}
+}
+
+func TestImportDevices_CSVNoHeader(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Create CSV content without header
+	csvContent := `GPON11111111,london-1
+GPON22222222,paris-1`
+
+	req := httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(csvContent))
+	req.Header.Set("Content-Type", "text/csv")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("import returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response ImportResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	if response.Imported != 2 {
+		t.Errorf("imported = %d, want 2", response.Imported)
+	}
+}
+
+func TestImportDevices_WithErrors(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Create CSV content with some invalid entries
+	csvContent := `serial,site_id
+GPON11111111,london-1
+ab,invalid@site
+GPON33333333,paris-1`
+
+	req := httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(csvContent))
+	req.Header.Set("Content-Type", "text/csv")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("import returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response ImportResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	if response.Imported != 2 {
+		t.Errorf("imported = %d, want 2 (valid entries only)", response.Imported)
+	}
+	if len(response.Errors) != 1 {
+		t.Errorf("expected 1 error, got %d: %v", len(response.Errors), response.Errors)
+	}
+}
+
+func TestImportDevices_ThirdDeviceAtSite_Error(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Try to import 3 devices to the same site
+	csvContent := `serial,site_id
+GPON11111111,london-1
+GPON22222222,london-1
+GPON33333333,london-1`
+
+	req := httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(csvContent))
+	req.Header.Set("Content-Type", "text/csv")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	var response ImportResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	if response.Imported != 2 {
+		t.Errorf("imported = %d, want 2 (first two only)", response.Imported)
+	}
+	if len(response.Errors) != 1 {
+		t.Errorf("expected 1 error for third device, got %d: %v", len(response.Errors), response.Errors)
+	}
+}
+
+func TestImportDevices_ExistingDevice(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// First, register a device via bootstrap
+	body := `{
+		"serial": "GPON11111111",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var bootstrapResp BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &bootstrapResp)
+
+	// Now import CSV that includes this device
+	csvContent := `serial,site_id
+GPON11111111,london-1`
+
+	req = httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(csvContent))
+	req.Header.Set("Content-Type", "text/csv")
+	w = httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("import returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response ImportResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	if response.Imported != 1 {
+		t.Errorf("imported = %d, want 1", response.Imported)
+	}
+
+	// Verify the existing device was assigned to the site
+	req = httptest.NewRequest("GET", "/api/v1/devices/"+bootstrapResp.NodeID, nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var deviceResp DeviceResponse
+	json.Unmarshal(w.Body.Bytes(), &deviceResp)
+
+	if deviceResp.SiteID != "london-1" {
+		t.Errorf("device site_id = %s, want london-1", deviceResp.SiteID)
+	}
+	if deviceResp.Status != "configured" {
+		t.Errorf("device status = %s, want configured", deviceResp.Status)
+	}
+}
+
+func TestImportDevices_EmptyCSV(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	req := httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(""))
+	req.Header.Set("Content-Type", "text/csv")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("import empty CSV returned status %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestImportDevices_HeaderOnly(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	csvContent := `serial,site_id`
+
+	req := httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(csvContent))
+	req.Header.Set("Content-Type", "text/csv")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("import header-only CSV returned status %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response ImportResponse
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	if response.Imported != 0 {
+		t.Errorf("imported = %d, want 0", response.Imported)
+	}
+}
+
+// ========================================================================
+// Delete Device Tests
+// ========================================================================
+
+func TestDeleteDevice_Unpairs_Partner(t *testing.T) {
+	server, _, _, _, deviceStore := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Register two devices
+	body := `{
+		"serial": "GPON11111111",
+		"mac": "00:11:22:33:44:55"
+	}`
+	req := httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var firstBootstrap BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &firstBootstrap)
+
+	body = `{
+		"serial": "GPON22222222",
+		"mac": "00:11:22:33:44:66"
+	}`
+	req = httptest.NewRequest("POST", "/api/v1/bootstrap", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var secondBootstrap BootstrapResponse
+	json.Unmarshal(w.Body.Bytes(), &secondBootstrap)
+
+	// Assign both to same site (creating HA pair)
+	assignBody := `{"site_id": "london-1"}`
+	for _, nodeID := range []string{firstBootstrap.NodeID, secondBootstrap.NodeID} {
+		req = httptest.NewRequest("PUT", "/api/v1/devices/"+nodeID, strings.NewReader(assignBody))
+		req.Header.Set("Content-Type", "application/json")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+	}
+
+	// Delete the standby device (second one)
+	req = httptest.NewRequest("DELETE", "/api/v1/devices/"+secondBootstrap.NodeID, nil)
+	w = httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("delete device returned status %d, want %d: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	// Verify the first device's partner was cleared and it's now active
+	firstDevice, err := deviceStore.GetDevice(nil, firstBootstrap.NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get first device: %v", err)
+	}
+	if firstDevice.PartnerNodeID != "" {
+		t.Errorf("first device partner_node_id = %s, want empty", firstDevice.PartnerNodeID)
+	}
+	if firstDevice.Role != store.DeviceRoleActive {
+		t.Errorf("first device role = %s, want active", firstDevice.Role)
+	}
+}
+
+func TestDeleteDevice_NotFound(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	req := httptest.NewRequest("DELETE", "/api/v1/devices/nonexistent-node", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("delete nonexistent device returned status %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+// ========================================================================
+// List Devices by Site Tests
+// ========================================================================
+
+func TestListDevices_FilterBySite(t *testing.T) {
+	server, _, _, _, _ := setupTestServerWithDevices()
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	// Create CSV with devices at different sites
+	csvContent := `serial,site_id
+GPON11111111,london-1
+GPON22222222,london-1
+GPON33333333,paris-1`
+
+	req := httptest.NewRequest("POST", "/api/v1/devices/import", strings.NewReader(csvContent))
+	req.Header.Set("Content-Type", "text/csv")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// List devices filtered by site
+	req = httptest.NewRequest("GET", "/api/v1/devices?site_id=london-1", nil)
+	w = httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("list devices returned status %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var response map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &response)
+
+	count, ok := response["count"].(float64)
+	if !ok || count != 2 {
+		t.Errorf("expected count 2 for london-1, got %v", response["count"])
+	}
+}

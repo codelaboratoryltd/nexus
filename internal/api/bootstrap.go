@@ -1,10 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -447,4 +451,375 @@ func deviceToResponse(d *store.Device) DeviceResponse {
 		LastSeen:      d.LastSeen,
 		Metadata:      d.Metadata,
 	}
+}
+
+// AssignDeviceRequest represents a request to assign a device to a site.
+type AssignDeviceRequest struct {
+	// SiteID is the site identifier to assign the device to.
+	SiteID string `json:"site_id"`
+}
+
+// AssignDeviceResponse is returned after assigning a device to a site.
+type AssignDeviceResponse struct {
+	// NodeID is the device's unique identifier.
+	NodeID string `json:"node_id"`
+
+	// SiteID is the assigned site identifier.
+	SiteID string `json:"site_id"`
+
+	// Role is the device role in an HA pair ("active" or "standby").
+	Role string `json:"role"`
+
+	// PartnerNodeID is the node ID of the HA partner (if paired).
+	PartnerNodeID string `json:"partner_node_id,omitempty"`
+
+	// Status is the device's current status.
+	Status string `json:"status"`
+
+	// Message provides additional context about the assignment.
+	Message string `json:"message"`
+}
+
+// ImportResponse is returned after bulk importing devices from CSV.
+type ImportResponse struct {
+	// Imported is the number of devices successfully imported.
+	Imported int `json:"imported"`
+
+	// Paired is the number of devices that got auto-paired.
+	Paired int `json:"paired"`
+
+	// Errors contains any errors encountered during import.
+	Errors []string `json:"errors,omitempty"`
+}
+
+// assignDevice assigns a device to a site with auto-pairing.
+// PUT /api/v1/devices/{node_id}
+func (s *Server) assignDevice(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get node_id from URL path using gorilla/mux
+	vars := mux.Vars(r)
+	nodeID := vars["node_id"]
+
+	if nodeID == "" {
+		respondError(w, http.StatusBadRequest, "node_id is required")
+		return
+	}
+
+	// Parse request body
+	var req AssignDeviceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
+		return
+	}
+
+	// Validate site_id
+	if err := validation.ValidateSiteID(req.SiteID); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Get the device
+	device, err := s.deviceStore.GetDevice(ctx, nodeID)
+	if err == store.ErrDeviceNotFound {
+		respondError(w, http.StatusNotFound, "device not found")
+		return
+	}
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to get device")
+		return
+	}
+
+	// Assign device to site with auto-pairing
+	response, err := s.assignDeviceToSite(ctx, device, req.SiteID)
+	if err != nil {
+		// Check if this is a site capacity error
+		if strings.Contains(err.Error(), "already has 2 devices") {
+			respondError(w, http.StatusConflict, err.Error())
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "failed to assign device: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// assignDeviceToSite handles the assignment of a device to a site with auto-pairing logic.
+func (s *Server) assignDeviceToSite(ctx context.Context, device *store.Device, siteID string) (*AssignDeviceResponse, error) {
+	// Get existing devices at this site
+	existing, err := s.deviceStore.ListDevicesBySite(ctx, siteID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list devices at site: %w", err)
+	}
+
+	// Filter out the current device if it's already at this site
+	var otherDevices []*store.Device
+	for _, d := range existing {
+		if d.NodeID != device.NodeID {
+			otherDevices = append(otherDevices, d)
+		}
+	}
+
+	var response AssignDeviceResponse
+	response.NodeID = device.NodeID
+	response.SiteID = siteID
+
+	switch len(otherDevices) {
+	case 0:
+		// First device at site - becomes active
+		device.SiteID = siteID
+		device.Role = store.DeviceRoleActive
+		device.Status = store.DeviceStatusConfigured
+		device.PartnerNodeID = ""
+
+		response.Role = string(store.DeviceRoleActive)
+		response.Status = string(store.DeviceStatusConfigured)
+		response.Message = "Device assigned as active (first device at site)"
+
+	case 1:
+		// Second device - becomes standby, pair with first
+		partner := otherDevices[0]
+
+		device.SiteID = siteID
+		device.Role = store.DeviceRoleStandby
+		device.Status = store.DeviceStatusConfigured
+		device.PartnerNodeID = partner.NodeID
+
+		// Update partner to know about this device
+		partner.PartnerNodeID = device.NodeID
+		if err := s.deviceStore.SaveDevice(ctx, partner); err != nil {
+			return nil, fmt.Errorf("failed to update partner device: %w", err)
+		}
+
+		response.Role = string(store.DeviceRoleStandby)
+		response.Status = string(store.DeviceStatusConfigured)
+		response.PartnerNodeID = partner.NodeID
+		response.Message = fmt.Sprintf("Device assigned as standby, paired with %s", partner.NodeID)
+
+	default:
+		return nil, fmt.Errorf("site %s already has 2 devices", siteID)
+	}
+
+	// Save the device
+	if err := s.deviceStore.SaveDevice(ctx, device); err != nil {
+		return nil, fmt.Errorf("failed to save device: %w", err)
+	}
+
+	return &response, nil
+}
+
+// importDevices imports devices from a CSV file.
+// POST /api/v1/devices/import
+// CSV format: serial,site_id
+func (s *Server) importDevices(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Check content type
+	contentType := r.Header.Get("Content-Type")
+
+	var csvReader *csv.Reader
+
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		// Handle multipart form data
+		if err := r.ParseMultipartForm(10 << 20); err != nil { // 10MB max
+			respondError(w, http.StatusBadRequest, "failed to parse multipart form: "+err.Error())
+			return
+		}
+
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			respondError(w, http.StatusBadRequest, "failed to get uploaded file: "+err.Error())
+			return
+		}
+		defer file.Close()
+
+		csvReader = csv.NewReader(file)
+	} else {
+		// Assume text/csv or application/octet-stream - read directly from body
+		csvReader = csv.NewReader(r.Body)
+	}
+
+	// Read all CSV records
+	records, err := csvReader.ReadAll()
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "failed to parse CSV: "+err.Error())
+		return
+	}
+
+	if len(records) == 0 {
+		respondError(w, http.StatusBadRequest, "CSV file is empty")
+		return
+	}
+
+	// Check if first row is a header
+	startRow := 0
+	firstRow := records[0]
+	if len(firstRow) >= 2 {
+		// If first row looks like a header, skip it
+		if strings.EqualFold(firstRow[0], "serial") && strings.EqualFold(firstRow[1], "site_id") {
+			startRow = 1
+		}
+	}
+
+	response := ImportResponse{
+		Errors: []string{},
+	}
+
+	for i := startRow; i < len(records); i++ {
+		row := records[i]
+		lineNum := i + 1
+
+		if len(row) < 2 {
+			response.Errors = append(response.Errors, fmt.Sprintf("line %d: expected 2 columns, got %d", lineNum, len(row)))
+			continue
+		}
+
+		serial := strings.TrimSpace(row[0])
+		siteID := strings.TrimSpace(row[1])
+
+		// Skip empty rows
+		if serial == "" && siteID == "" {
+			continue
+		}
+
+		// Validate serial number
+		if err := validation.ValidateSerialNumber(serial); err != nil {
+			response.Errors = append(response.Errors, fmt.Sprintf("line %d: %s", lineNum, err.Error()))
+			continue
+		}
+
+		// Validate site_id
+		if err := validation.ValidateSiteID(siteID); err != nil {
+			response.Errors = append(response.Errors, fmt.Sprintf("line %d: %s", lineNum, err.Error()))
+			continue
+		}
+
+		// Check if device already exists by serial
+		existingDevice, err := s.deviceStore.GetDeviceBySerial(ctx, serial)
+		if err != nil && err != store.ErrDeviceNotFound {
+			response.Errors = append(response.Errors, fmt.Sprintf("line %d: failed to check device: %s", lineNum, err.Error()))
+			continue
+		}
+
+		var device *store.Device
+		now := time.Now()
+
+		if existingDevice != nil {
+			// Device already registered - assign to site
+			device = existingDevice
+		} else {
+			// Pre-configure device before it registers
+			// Generate a placeholder node ID based on serial
+			// (will be regenerated with proper MAC when device actually bootstraps)
+			nodeID := generateNodeID(serial, "00:00:00:00:00:00")
+
+			device = &store.Device{
+				NodeID:    nodeID,
+				Serial:    serial,
+				Status:    store.DeviceStatusPending, // Will be set to configured by assignDeviceToSite
+				FirstSeen: now,
+				LastSeen:  now,
+			}
+
+			// Save the pre-configured device first
+			if err := s.deviceStore.SaveDevice(ctx, device); err != nil {
+				response.Errors = append(response.Errors, fmt.Sprintf("line %d: failed to create device: %s", lineNum, err.Error()))
+				continue
+			}
+		}
+
+		// Assign device to site
+		assignResp, err := s.assignDeviceToSite(ctx, device, siteID)
+		if err != nil {
+			response.Errors = append(response.Errors, fmt.Sprintf("line %d (serial %s): %s", lineNum, serial, err.Error()))
+			continue
+		}
+
+		response.Imported++
+
+		// Check if device was paired
+		if assignResp.PartnerNodeID != "" {
+			response.Paired++
+		}
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// deleteDevice removes a device from the system and unpairs its partner if necessary.
+// DELETE /api/v1/devices/{node_id}
+func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get node_id from URL path using gorilla/mux
+	vars := mux.Vars(r)
+	nodeID := vars["node_id"]
+
+	if nodeID == "" {
+		respondError(w, http.StatusBadRequest, "node_id is required")
+		return
+	}
+
+	// Get the device first to check for partner
+	device, err := s.deviceStore.GetDevice(ctx, nodeID)
+	if err == store.ErrDeviceNotFound {
+		respondError(w, http.StatusNotFound, "device not found")
+		return
+	}
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to get device")
+		return
+	}
+
+	// If device has a partner, unpair them
+	if device.PartnerNodeID != "" {
+		partner, err := s.deviceStore.GetDevice(ctx, device.PartnerNodeID)
+		if err == nil {
+			// Clear partner's reference to this device and promote to active
+			partner.PartnerNodeID = ""
+			partner.Role = store.DeviceRoleActive
+			if err := s.deviceStore.SaveDevice(ctx, partner); err != nil {
+				// Log but don't fail - best effort to update partner
+			}
+		}
+	}
+
+	// Delete the device
+	if err := s.deviceStore.DeleteDevice(ctx, nodeID); err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to delete device")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "device deleted successfully",
+		"node_id": nodeID,
+	})
+}
+
+// parseCSVLine parses a single line of CSV data.
+func parseCSVLine(line string) ([]string, error) {
+	reader := csv.NewReader(strings.NewReader(line))
+	return reader.Read()
+}
+
+// streamingCSVReader reads CSV records one at a time.
+type streamingCSVReader struct {
+	scanner *bufio.Scanner
+}
+
+func newStreamingCSVReader(r io.Reader) *streamingCSVReader {
+	return &streamingCSVReader{
+		scanner: bufio.NewScanner(r),
+	}
+}
+
+func (s *streamingCSVReader) Read() ([]string, error) {
+	if !s.scanner.Scan() {
+		if err := s.scanner.Err(); err != nil {
+			return nil, err
+		}
+		return nil, io.EOF
+	}
+	return parseCSVLine(s.scanner.Text())
 }
