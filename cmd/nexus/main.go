@@ -16,9 +16,14 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
 	badgerds "github.com/ipfs/go-ds-badger4"
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	libp2pHost "github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
+	rendezvous "github.com/waku-org/go-libp2p-rendezvous"
+	rvzSQLite "github.com/waku-org/go-libp2p-rendezvous/db/sqlite"
 
 	"github.com/codelaboratoryltd/nexus/internal/api"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
@@ -44,6 +49,10 @@ type Config struct {
 	DataPath    string
 	Bootstrap   []string
 	P2PEnabled  bool
+
+	// Rendezvous discovery config
+	RendezvousServer    string
+	RendezvousNamespace string
 
 	// ZTP DHCP server config
 	ZTPEnabled   bool
@@ -77,6 +86,13 @@ func rootCommand() *cobra.Command {
 		Use:   "serve",
 		Short: "Start the Nexus server",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Allow environment variables to override flags
+			if v := os.Getenv("NEXUS_RENDEZVOUS_SERVER"); v != "" && cfg.RendezvousServer == "" {
+				cfg.RendezvousServer = v
+			}
+			if v := os.Getenv("NEXUS_RENDEZVOUS_NAMESPACE"); v != "" && cfg.RendezvousNamespace == "nexus" {
+				cfg.RendezvousNamespace = v
+			}
 			return runServer(cfg)
 		},
 	}
@@ -89,6 +105,8 @@ func rootCommand() *cobra.Command {
 	serve.Flags().StringVar(&cfg.DataPath, "data-path", "data", "Data directory path")
 	serve.Flags().StringSliceVar(&cfg.Bootstrap, "bootstrap", nil, "Bootstrap peer addresses")
 	serve.Flags().BoolVar(&cfg.P2PEnabled, "p2p", false, "Enable P2P mode with CLSet CRDT")
+	serve.Flags().StringVar(&cfg.RendezvousServer, "rendezvous-server", "", "Rendezvous server multiaddr for P2P discovery (e.g., /ip4/x.x.x.x/tcp/8765/p2p/QmPeerID)")
+	serve.Flags().StringVar(&cfg.RendezvousNamespace, "rendezvous-namespace", "nexus", "Rendezvous namespace for peer discovery")
 
 	// ZTP DHCP server flags
 	serve.Flags().BoolVar(&cfg.ZTPEnabled, "ztp", false, "Enable ZTP DHCP server for OLT-BNG provisioning")
@@ -105,7 +123,45 @@ func rootCommand() *cobra.Command {
 		},
 	}
 
-	root.AddCommand(serve, version)
+	// Rendezvous server command
+	var rvzPort int
+	var rvzDataPath string
+	rendezvousCmd := &cobra.Command{
+		Use:   "rendezvous",
+		Short: "Run a libp2p rendezvous server for peer discovery",
+		Long: `Run a rendezvous server that enables P2P peer discovery in environments
+where mDNS doesn't work (e.g., Kubernetes). Nexus nodes can connect to this
+server to register themselves and discover other peers.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRendezvousServer(rvzPort, rvzDataPath)
+		},
+	}
+	rendezvousCmd.Flags().IntVar(&rvzPort, "port", 8765, "Rendezvous server listen port")
+	rendezvousCmd.Flags().StringVar(&rvzDataPath, "data-path", "rendezvous-data", "Data directory for rendezvous server")
+
+	// Peer ID command - prints the peer ID for a given data path
+	var peerIDDataPath string
+	peerIDCmd := &cobra.Command{
+		Use:   "peer-id",
+		Short: "Print the peer ID for a given data directory",
+		Long: `Print the libp2p peer ID derived from the private key in the data directory.
+Useful for configuring rendezvous server addresses for clients.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pk, err := loadOrGenerateKey(peerIDDataPath)
+			if err != nil {
+				return fmt.Errorf("failed to load key: %w", err)
+			}
+			pid, err := peer.IDFromPublicKey(pk.GetPublic())
+			if err != nil {
+				return fmt.Errorf("failed to get peer ID: %w", err)
+			}
+			fmt.Println(pid.String())
+			return nil
+		},
+	}
+	peerIDCmd.Flags().StringVar(&peerIDDataPath, "data-path", "data", "Data directory containing node.key")
+
+	root.AddCommand(serve, version, rendezvousCmd, peerIDCmd)
 	return root
 }
 
@@ -118,6 +174,9 @@ func runServer(cfg Config) error {
 	fmt.Printf("  HTTP:     http://localhost:%d\n", cfg.HTTPPort)
 	fmt.Printf("  Metrics:  http://localhost:%d/metrics\n", cfg.MetricsPort)
 	fmt.Printf("  P2P:      %v (port %d)\n", cfg.P2PEnabled, cfg.P2PPort)
+	if cfg.RendezvousServer != "" {
+		fmt.Printf("  Rendezvous: %s (namespace: %s)\n", cfg.RendezvousServer, cfg.RendezvousNamespace)
+	}
 	fmt.Printf("  ZTP:      %v\n", cfg.ZTPEnabled)
 
 	var (
@@ -153,13 +212,15 @@ func runServer(cfg Config) error {
 
 		// Initialize state manager with P2P
 		stateCfg := state.Config{
-			PrivateKey:     pk,
-			ListenPort:     uint32(cfg.P2PPort),
-			Role:           cfg.Role,
-			Topic:          "nexus-state",
-			Bootstrap:      cfg.Bootstrap,
-			Datastore:      bds,
-			EventQueueSize: 1000,
+			PrivateKey:          pk,
+			ListenPort:          uint32(cfg.P2PPort),
+			Role:                cfg.Role,
+			Topic:               "nexus-state",
+			Bootstrap:           cfg.Bootstrap,
+			Datastore:           bds,
+			EventQueueSize:      1000,
+			RendezvousServer:    cfg.RendezvousServer,
+			RendezvousNamespace: cfg.RendezvousNamespace,
 		}
 
 		stateManager, err := state.NewStateManager(ctx, stateCfg)
@@ -425,4 +486,71 @@ func (m *memoryStateStore) GetMembers(ctx context.Context) map[string]*store.Nod
 		m.members = make(map[string]*store.NodeMember)
 	}
 	return m.members
+}
+
+// runRendezvousServer starts a libp2p rendezvous server for peer discovery.
+func runRendezvousServer(port int, dataPath string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fmt.Printf("Starting Nexus Rendezvous Server\n")
+	fmt.Printf("  Port:     %d\n", port)
+	fmt.Printf("  Data:     %s\n", dataPath)
+
+	// Create data directory
+	if err := os.MkdirAll(dataPath, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	// Load or generate key
+	pk, err := loadOrGenerateKey(dataPath)
+	if err != nil {
+		return fmt.Errorf("failed to load/generate key: %w", err)
+	}
+
+	// Create libp2p host
+	h, err := createRendezvousHost(pk, port)
+	if err != nil {
+		return fmt.Errorf("failed to create libp2p host: %w", err)
+	}
+	defer h.Close()
+
+	// Open SQLite database for rendezvous registrations
+	dbPath := dataPath + "/rendezvous.db"
+	rvzDB, err := rvzSQLite.OpenDB(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open rendezvous database: %w", err)
+	}
+	defer rvzDB.Close()
+
+	// Create and start rendezvous service
+	_ = rendezvous.NewRendezvousService(h, rvzDB)
+
+	// Print server info
+	for _, addr := range h.Addrs() {
+		fmt.Printf("  Listening: %s/p2p/%s\n", addr, h.ID())
+	}
+	fmt.Printf("\nRendezvous server ready!\n")
+	fmt.Printf("Connect nodes with: --rendezvous-server=%s/p2p/%s\n", h.Addrs()[0], h.ID())
+
+	// Wait for shutdown signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
+	case <-ctx.Done():
+	}
+
+	fmt.Println("Rendezvous server stopped")
+	return nil
+}
+
+// createRendezvousHost creates a minimal libp2p host for the rendezvous server.
+func createRendezvousHost(pk crypto.PrivKey, port int) (libp2pHost.Host, error) {
+	return libp2p.New(
+		libp2p.Identity(pk),
+		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)),
+	)
 }
