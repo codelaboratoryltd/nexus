@@ -6,6 +6,7 @@ require (
 	github.com/apparentlymart/go-cidr v1.1.0
 	github.com/dgraph-io/badger/v4 v4.9.0
 	github.com/fxamacker/cbor/v2 v2.9.0
+	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	github.com/hsanjuan/ipfs-lite v1.8.6
 	github.com/insomniacslk/dhcp v0.0.0-20251020182700-175e84fbb167
@@ -18,6 +19,7 @@ require (
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/spf13/cobra v1.10.2
+	github.com/waku-org/go-libp2p-rendezvous v0.0.0-20240110193335-a67d1cc760a0
 )
 
 // Use vitrifi's fork of go-ds-crdt with CLSet extensions
@@ -45,7 +47,6 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/gopacket v1.1.19 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
@@ -85,6 +86,7 @@ require (
 	github.com/libp2p/go-yamux/v5 v5.0.1 // indirect
 	github.com/marten-seemann/tcp v0.0.0-20210406111302-dfbc87cc63fd // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mattn/go-sqlite3 v1.14.17 // indirect
 	github.com/miekg/dns v1.1.67 // indirect
 	github.com/mikioh/tcpinfo v0.0.0-20190314235526-30a79bb1804b // indirect
 	github.com/mikioh/tcpopt v0.0.0-20190314235656-172688c1accc // indirect

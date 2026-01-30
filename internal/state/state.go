@@ -20,9 +20,12 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 	libpubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/discovery"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
+	rendezvous "github.com/waku-org/go-libp2p-rendezvous"
 )
 
 const (
@@ -57,6 +60,10 @@ type Config struct {
 	Bootstrap      []string
 	Datastore      ds.Batching
 	EventQueueSize uint32
+
+	// Rendezvous discovery configuration
+	RendezvousServer    string // Multiaddr of rendezvous server (e.g., "/ip4/127.0.0.1/tcp/8765/p2p/QmPeerID")
+	RendezvousNamespace string // Namespace for peer discovery (default: "nexus")
 }
 
 // State manages pools, allocations, and nodes in a distributed system.
@@ -178,6 +185,15 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 	// Perform bootstrapping
 	bootstrapPeers(ctx, log, h, cfg.Bootstrap)
 
+	// Start rendezvous discovery if configured
+	if cfg.RendezvousServer != "" {
+		namespace := cfg.RendezvousNamespace
+		if namespace == "" {
+			namespace = "nexus"
+		}
+		go manager.runRendezvousDiscovery(ctx, h, cfg.RendezvousServer, namespace)
+	}
+
 	err = manager.syncState(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("sync state: %w", err)
@@ -235,6 +251,88 @@ func bootstrapPeers(ctx context.Context, log *logging.ZapEventLogger, h host.Hos
 		log.Infof("Connecting to bootstrap peer: %s", addr)
 		if err := h.Connect(ctx, *peerInfo); err != nil {
 			log.Warnf("Failed to connect to bootstrap peer %s: %v", addr, err)
+		}
+	}
+}
+
+// runRendezvousDiscovery registers with a rendezvous server and discovers peers.
+// This enables peer discovery in environments where mDNS doesn't work (e.g., Kubernetes).
+func (s *State) runRendezvousDiscovery(ctx context.Context, h host.Host, serverAddr, namespace string) {
+	// Parse the rendezvous server multiaddr
+	ma, err := multiaddr.NewMultiaddr(serverAddr)
+	if err != nil {
+		s.log.Errorf("Invalid rendezvous server address %s: %v", serverAddr, err)
+		return
+	}
+
+	peerInfo, err := peer.AddrInfoFromP2pAddr(ma)
+	if err != nil {
+		s.log.Errorf("Could not parse rendezvous server peer address %s: %v", serverAddr, err)
+		return
+	}
+
+	s.log.Infof("Connecting to rendezvous server: %s", serverAddr)
+
+	// Connect to the rendezvous server
+	if err := h.Connect(ctx, *peerInfo); err != nil {
+		s.log.Errorf("Failed to connect to rendezvous server %s: %v", serverAddr, err)
+		return
+	}
+
+	s.log.Infof("Connected to rendezvous server, starting discovery for namespace: %s", namespace)
+
+	// Create rendezvous discovery using the server peer ID
+	discovery := rendezvous.NewRendezvousDiscovery(h, peerInfo.ID)
+
+	// Advertise our presence in the namespace
+	// TTL of 2 hours (7200 seconds) is the default
+	util.Advertise(ctx, discovery, namespace)
+	s.log.Infof("Registered with rendezvous server in namespace: %s", namespace)
+
+	// Continuously discover and connect to peers
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Discover immediately, then periodically
+	s.discoverPeers(ctx, h, discovery, namespace)
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("Rendezvous discovery stopped")
+			return
+		case <-ticker.C:
+			s.discoverPeers(ctx, h, discovery, namespace)
+		}
+	}
+}
+
+// discoverPeers finds and connects to peers in the rendezvous namespace.
+func (s *State) discoverPeers(ctx context.Context, h host.Host, disc discovery.Discovery, namespace string) {
+	peerChan, err := disc.FindPeers(ctx, namespace)
+	if err != nil {
+		s.log.Warnf("Failed to find peers in namespace %s: %v", namespace, err)
+		return
+	}
+
+	for p := range peerChan {
+		// Skip ourselves
+		if p.ID == h.ID() {
+			continue
+		}
+
+		// Skip if already connected
+		if h.Network().Connectedness(p.ID) == 1 { // 1 = Connected
+			continue
+		}
+
+		s.log.Infof("Discovered peer via rendezvous: %s", p.ID)
+
+		// Attempt to connect
+		if err := h.Connect(ctx, p); err != nil {
+			s.log.Warnf("Failed to connect to discovered peer %s: %v", p.ID, err)
+		} else {
+			s.log.Infof("Connected to peer via rendezvous: %s", p.ID)
 		}
 	}
 }
