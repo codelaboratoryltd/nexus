@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -10,35 +11,49 @@ import (
 	"github.com/codelaboratoryltd/nexus/internal/store"
 )
 
+// ReadinessChecker provides peer discovery status for the ready endpoint.
+type ReadinessChecker interface {
+	IsPeerDiscoveryReady() bool
+	ConnectedPeerCount() int
+}
+
 // Server provides the HTTP API for Nexus.
 type Server struct {
-	ring        *hashring.VirtualHashRing
-	poolStore   store.PoolStore
-	nodeStore   store.NodeStore
-	allocStore  store.AllocationStore
-	deviceStore store.DeviceStore
+	ring             *hashring.VirtualHashRing
+	poolStore        store.PoolStore
+	nodeStore        store.NodeStore
+	allocStore       store.AllocationStore
+	deviceStore      store.DeviceStore
+	readinessChecker ReadinessChecker
 }
 
 // NewServer creates a new API server.
 func NewServer(ring *hashring.VirtualHashRing, poolStore store.PoolStore, nodeStore store.NodeStore, allocStore store.AllocationStore) *Server {
 	return &Server{
-		ring:        ring,
-		poolStore:   poolStore,
-		nodeStore:   nodeStore,
-		allocStore:  allocStore,
-		deviceStore: nil, // Use SetDeviceStore to enable bootstrap API
+		ring:             ring,
+		poolStore:        poolStore,
+		nodeStore:        nodeStore,
+		allocStore:       allocStore,
+		deviceStore:      nil, // Use SetDeviceStore to enable bootstrap API
+		readinessChecker: nil, // Use SetReadinessChecker to enable peer discovery readiness
 	}
 }
 
 // NewServerWithDevices creates a new API server with device store support.
 func NewServerWithDevices(ring *hashring.VirtualHashRing, poolStore store.PoolStore, nodeStore store.NodeStore, allocStore store.AllocationStore, deviceStore store.DeviceStore) *Server {
 	return &Server{
-		ring:        ring,
-		poolStore:   poolStore,
-		nodeStore:   nodeStore,
-		allocStore:  allocStore,
-		deviceStore: deviceStore,
+		ring:             ring,
+		poolStore:        poolStore,
+		nodeStore:        nodeStore,
+		allocStore:       allocStore,
+		deviceStore:      deviceStore,
+		readinessChecker: nil,
 	}
+}
+
+// SetReadinessChecker sets the readiness checker for peer discovery status.
+func (s *Server) SetReadinessChecker(checker ReadinessChecker) {
+	s.readinessChecker = checker
 }
 
 // SetDeviceStore sets the device store, enabling the bootstrap API.
@@ -109,7 +124,25 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // readyHandler returns readiness status.
+// If a readiness checker is configured (P2P mode with DNS discovery),
+// this will return 503 until peer discovery is ready.
 func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ready"))
+	// If no readiness checker is configured, always return ready (standalone mode)
+	if s.readinessChecker == nil {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready"))
+		return
+	}
+
+	// Check peer discovery status
+	if s.readinessChecker.IsPeerDiscoveryReady() {
+		peerCount := s.readinessChecker.ConnectedPeerCount()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(fmt.Sprintf("ready (peers: %d)", peerCount)))
+		return
+	}
+
+	// Not ready yet - waiting for peer discovery
+	w.WriteHeader(http.StatusServiceUnavailable)
+	w.Write([]byte("waiting for peer discovery"))
 }

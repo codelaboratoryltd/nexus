@@ -50,9 +50,17 @@ type Config struct {
 	Bootstrap   []string
 	P2PEnabled  bool
 
+	// Discovery mode config
+	DiscoveryMode string // "none", "rendezvous", "dns"
+
 	// Rendezvous discovery config
 	RendezvousServer    string
 	RendezvousNamespace string
+
+	// DNS discovery config (for Kubernetes headless services)
+	DNSServiceName  string
+	DNSPollInterval time.Duration
+	DNSReadyTimeout time.Duration
 
 	// ZTP DHCP server config
 	ZTPEnabled   bool
@@ -87,11 +95,17 @@ func rootCommand() *cobra.Command {
 		Short: "Start the Nexus server",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Allow environment variables to override flags
+			if v := os.Getenv("NEXUS_DISCOVERY"); v != "" && cfg.DiscoveryMode == "" {
+				cfg.DiscoveryMode = v
+			}
 			if v := os.Getenv("NEXUS_RENDEZVOUS_SERVER"); v != "" && cfg.RendezvousServer == "" {
 				cfg.RendezvousServer = v
 			}
 			if v := os.Getenv("NEXUS_RENDEZVOUS_NAMESPACE"); v != "" && cfg.RendezvousNamespace == "nexus" {
 				cfg.RendezvousNamespace = v
+			}
+			if v := os.Getenv("NEXUS_DNS_SERVICE_NAME"); v != "" && cfg.DNSServiceName == "" {
+				cfg.DNSServiceName = v
 			}
 			return runServer(cfg)
 		},
@@ -105,8 +119,17 @@ func rootCommand() *cobra.Command {
 	serve.Flags().StringVar(&cfg.DataPath, "data-path", "data", "Data directory path")
 	serve.Flags().StringSliceVar(&cfg.Bootstrap, "bootstrap", nil, "Bootstrap peer addresses")
 	serve.Flags().BoolVar(&cfg.P2PEnabled, "p2p", false, "Enable P2P mode with CLSet CRDT")
+	// Discovery mode flags
+	serve.Flags().StringVar(&cfg.DiscoveryMode, "discovery", "", "Peer discovery mode: none, rendezvous, dns (default: auto-detect)")
+
+	// Rendezvous discovery flags
 	serve.Flags().StringVar(&cfg.RendezvousServer, "rendezvous-server", "", "Rendezvous server multiaddr for P2P discovery (e.g., /ip4/x.x.x.x/tcp/8765/p2p/QmPeerID)")
 	serve.Flags().StringVar(&cfg.RendezvousNamespace, "rendezvous-namespace", "nexus", "Rendezvous namespace for peer discovery")
+
+	// DNS discovery flags (for Kubernetes headless services)
+	serve.Flags().StringVar(&cfg.DNSServiceName, "dns-service-name", "", "Headless service DNS name for peer discovery (e.g., nexus.namespace.svc.cluster.local)")
+	serve.Flags().DurationVar(&cfg.DNSPollInterval, "dns-poll-interval", 10*time.Second, "How often to poll DNS for peer discovery")
+	serve.Flags().DurationVar(&cfg.DNSReadyTimeout, "dns-ready-timeout", 30*time.Second, "Timeout before marking ready without peers (for first node)")
 
 	// ZTP DHCP server flags
 	serve.Flags().BoolVar(&cfg.ZTPEnabled, "ztp", false, "Enable ZTP DHCP server for OLT-BNG provisioning")
@@ -174,16 +197,23 @@ func runServer(cfg Config) error {
 	fmt.Printf("  HTTP:     http://localhost:%d\n", cfg.HTTPPort)
 	fmt.Printf("  Metrics:  http://localhost:%d/metrics\n", cfg.MetricsPort)
 	fmt.Printf("  P2P:      %v (port %d)\n", cfg.P2PEnabled, cfg.P2PPort)
+	if cfg.DiscoveryMode != "" {
+		fmt.Printf("  Discovery: %s\n", cfg.DiscoveryMode)
+	}
 	if cfg.RendezvousServer != "" {
 		fmt.Printf("  Rendezvous: %s (namespace: %s)\n", cfg.RendezvousServer, cfg.RendezvousNamespace)
+	}
+	if cfg.DNSServiceName != "" {
+		fmt.Printf("  DNS Service: %s (poll: %s, timeout: %s)\n", cfg.DNSServiceName, cfg.DNSPollInterval, cfg.DNSReadyTimeout)
 	}
 	fmt.Printf("  ZTP:      %v\n", cfg.ZTPEnabled)
 
 	var (
-		ring       *hashring.VirtualHashRing
-		poolStore  store.PoolStore
-		nodeStore  store.NodeStore
-		allocStore store.AllocationStore
+		ring         *hashring.VirtualHashRing
+		poolStore    store.PoolStore
+		nodeStore    store.NodeStore
+		allocStore   store.AllocationStore
+		stateManager *state.State
 	)
 
 	if cfg.P2PEnabled {
@@ -219,11 +249,15 @@ func runServer(cfg Config) error {
 			Bootstrap:           cfg.Bootstrap,
 			Datastore:           bds,
 			EventQueueSize:      1000,
+			DiscoveryMode:       state.DiscoveryMode(cfg.DiscoveryMode),
 			RendezvousServer:    cfg.RendezvousServer,
 			RendezvousNamespace: cfg.RendezvousNamespace,
+			DNSServiceName:      cfg.DNSServiceName,
+			DNSPollInterval:     cfg.DNSPollInterval,
+			DNSReadyTimeout:     cfg.DNSReadyTimeout,
 		}
 
-		stateManager, err := state.NewStateManager(ctx, stateCfg)
+		stateManager, err = state.NewStateManager(ctx, stateCfg)
 		if err != nil {
 			return fmt.Errorf("failed to create state manager: %w", err)
 		}
@@ -253,6 +287,11 @@ func runServer(cfg Config) error {
 
 	// Create API server
 	apiServer := api.NewServer(ring, poolStore, nodeStore, allocStore)
+
+	// Set readiness checker if in P2P mode with DNS discovery
+	if stateManager != nil && (cfg.DiscoveryMode == "dns" || cfg.DNSServiceName != "") {
+		apiServer.SetReadinessChecker(stateManager)
+	}
 
 	// Create HTTP router
 	router := mux.NewRouter()

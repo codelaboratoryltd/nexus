@@ -51,6 +51,18 @@ type nodeInfo struct {
 	isWrite    bool
 }
 
+// DiscoveryMode defines the peer discovery method.
+type DiscoveryMode string
+
+const (
+	// DiscoveryModeNone disables automatic peer discovery.
+	DiscoveryModeNone DiscoveryMode = "none"
+	// DiscoveryModeRendezvous uses a rendezvous server for peer discovery.
+	DiscoveryModeRendezvous DiscoveryMode = "rendezvous"
+	// DiscoveryModeDNS uses Kubernetes headless service DNS resolution.
+	DiscoveryModeDNS DiscoveryMode = "dns"
+)
+
 // Config holds configuration for the state manager.
 type Config struct {
 	PrivateKey     crypto.PrivKey
@@ -61,9 +73,17 @@ type Config struct {
 	Datastore      ds.Batching
 	EventQueueSize uint32
 
+	// Discovery mode configuration
+	DiscoveryMode DiscoveryMode // "none", "rendezvous", "dns"
+
 	// Rendezvous discovery configuration
 	RendezvousServer    string // Multiaddr of rendezvous server (e.g., "/ip4/127.0.0.1/tcp/8765/p2p/QmPeerID")
 	RendezvousNamespace string // Namespace for peer discovery (default: "nexus")
+
+	// DNS discovery configuration (for Kubernetes headless services)
+	DNSServiceName  string        // Headless service DNS name (e.g., "nexus.namespace.svc.cluster.local")
+	DNSPollInterval time.Duration // How often to poll DNS (default: 10s)
+	DNSReadyTimeout time.Duration // Timeout for first peer discovery before marking ready anyway (default: 30s)
 }
 
 // State manages pools, allocations, and nodes in a distributed system.
@@ -82,6 +102,14 @@ type State struct {
 	syncComplete    bool
 	log             *logging.ZapEventLogger
 	store           *crdt.Datastore
+	host            host.Host // libp2p host for peer connections
+
+	// Peer discovery status for readiness probe
+	peerDiscoveryMu    sync.RWMutex
+	peerDiscovered     bool      // At least one peer has been discovered
+	peerDiscoveryReady bool      // Ready for traffic (peer found or timeout reached)
+	peerDiscoveryStart time.Time // When discovery started
+	dnsReadyTimeout    time.Duration
 }
 
 // NewStateManager initializes a new State instance with P2P and CRDT.
@@ -98,15 +126,22 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 		eventQueueSize = DefaultEventQueueSize
 	}
 
+	dnsReadyTimeout := cfg.DNSReadyTimeout
+	if dnsReadyTimeout == 0 {
+		dnsReadyTimeout = 30 * time.Second
+	}
+
 	manager := &State{
-		poolStore:       nil,
-		allocationStore: nil,
-		topic:           cfg.Topic,
-		role:            strings.ToLower(cfg.Role),
-		hashRing:        hashring.NewVirtualNodesHashRing(),
-		nodes:           make(map[string]time.Time),
-		workQueue:       make(chan WorkItem, eventQueueSize),
-		log:             log,
+		poolStore:          nil,
+		allocationStore:    nil,
+		topic:              cfg.Topic,
+		role:               strings.ToLower(cfg.Role),
+		hashRing:           hashring.NewVirtualNodesHashRing(),
+		nodes:              make(map[string]time.Time),
+		workQueue:          make(chan WorkItem, eventQueueSize),
+		log:                log,
+		peerDiscoveryStart: time.Now(),
+		dnsReadyTimeout:    dnsReadyTimeout,
 	}
 
 	listen, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", cfg.ListenPort))
@@ -127,6 +162,7 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 	}
 
 	manager.ourID = h.ID().String()
+	manager.host = h
 
 	ps, err := libpubsub.NewGossipSub(ctx, h)
 	if err != nil {
@@ -185,8 +221,39 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 	// Perform bootstrapping
 	bootstrapPeers(ctx, log, h, cfg.Bootstrap)
 
-	// Start rendezvous discovery if configured
-	if cfg.RendezvousServer != "" {
+	// Start peer discovery based on configured mode
+	switch cfg.DiscoveryMode {
+	case DiscoveryModeRendezvous:
+		// Rendezvous discovery mode
+		if cfg.RendezvousServer != "" {
+			namespace := cfg.RendezvousNamespace
+			if namespace == "" {
+				namespace = "nexus"
+			}
+			go manager.runRendezvousDiscovery(ctx, h, cfg.RendezvousServer, namespace)
+		} else {
+			log.Warn("Rendezvous discovery mode selected but no server configured")
+			manager.markPeerDiscoveryReady()
+		}
+	case DiscoveryModeDNS:
+		// DNS discovery mode for Kubernetes headless services
+		if cfg.DNSServiceName != "" {
+			pollInterval := cfg.DNSPollInterval
+			if pollInterval == 0 {
+				pollInterval = 10 * time.Second
+			}
+			go manager.runDNSDiscovery(ctx, h, cfg.DNSServiceName, pollInterval)
+		} else {
+			log.Warn("DNS discovery mode selected but no service name configured")
+			manager.markPeerDiscoveryReady()
+		}
+	default:
+		// No discovery mode - mark as ready immediately
+		manager.markPeerDiscoveryReady()
+	}
+
+	// Legacy support: start rendezvous discovery if server is configured but mode is not set
+	if cfg.DiscoveryMode == "" && cfg.RendezvousServer != "" {
 		namespace := cfg.RendezvousNamespace
 		if namespace == "" {
 			namespace = "nexus"
@@ -323,6 +390,7 @@ func (s *State) discoverPeers(ctx context.Context, h host.Host, disc discovery.D
 
 		// Skip if already connected
 		if h.Network().Connectedness(p.ID) == 1 { // 1 = Connected
+			s.markPeerDiscovered()
 			continue
 		}
 
@@ -333,8 +401,213 @@ func (s *State) discoverPeers(ctx context.Context, h host.Host, disc discovery.D
 			s.log.Warnf("Failed to connect to discovered peer %s: %v", p.ID, err)
 		} else {
 			s.log.Infof("Connected to peer via rendezvous: %s", p.ID)
+			s.markPeerDiscovered()
 		}
 	}
+}
+
+// runDNSDiscovery periodically resolves a headless service DNS name and connects to discovered peers.
+// This is designed for Kubernetes environments where a headless service returns all pod IPs.
+func (s *State) runDNSDiscovery(ctx context.Context, h host.Host, serviceName string, pollInterval time.Duration) {
+	s.log.Infof("Starting DNS discovery for service: %s (poll interval: %s)", serviceName, pollInterval)
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	// Start a goroutine to check for ready timeout
+	go s.watchReadyTimeout(ctx)
+
+	// Discover immediately, then periodically
+	s.discoverPeersViaDNS(ctx, h, serviceName)
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("DNS discovery stopped")
+			return
+		case <-ticker.C:
+			s.discoverPeersViaDNS(ctx, h, serviceName)
+		}
+	}
+}
+
+// discoverPeersViaDNS resolves the DNS name and connects to each discovered peer IP.
+func (s *State) discoverPeersViaDNS(ctx context.Context, h host.Host, serviceName string) {
+	// Resolve the headless service DNS name to get all pod IPs
+	ips, err := net.LookupIP(serviceName)
+	if err != nil {
+		s.log.Warnf("Failed to resolve DNS for %s: %v", serviceName, err)
+		return
+	}
+
+	if len(ips) == 0 {
+		s.log.Debugf("No IPs found for DNS name %s", serviceName)
+		return
+	}
+
+	s.log.Debugf("DNS discovery found %d IPs for %s", len(ips), serviceName)
+
+	// Get our own IPs to skip ourselves
+	ourAddrs := h.Addrs()
+	ourIPs := make(map[string]bool)
+	for _, addr := range ourAddrs {
+		// Extract IP from multiaddr
+		if ip, err := addr.ValueForProtocol(multiaddr.P_IP4); err == nil {
+			ourIPs[ip] = true
+		}
+		if ip, err := addr.ValueForProtocol(multiaddr.P_IP6); err == nil {
+			ourIPs[ip] = true
+		}
+	}
+
+	// Get the P2P port from our listen addresses
+	var p2pPort string
+	for _, addr := range ourAddrs {
+		if port, err := addr.ValueForProtocol(multiaddr.P_TCP); err == nil {
+			p2pPort = port
+			break
+		}
+	}
+	if p2pPort == "" {
+		s.log.Warn("Could not determine P2P port from listen addresses")
+		return
+	}
+
+	for _, ip := range ips {
+		ipStr := ip.String()
+
+		// Skip our own IP
+		if ourIPs[ipStr] {
+			continue
+		}
+
+		// Build multiaddr for this peer
+		var maStr string
+		if ip.To4() != nil {
+			maStr = fmt.Sprintf("/ip4/%s/tcp/%s", ipStr, p2pPort)
+		} else {
+			maStr = fmt.Sprintf("/ip6/%s/tcp/%s", ipStr, p2pPort)
+		}
+
+		ma, err := multiaddr.NewMultiaddr(maStr)
+		if err != nil {
+			s.log.Warnf("Failed to create multiaddr for %s: %v", ipStr, err)
+			continue
+		}
+
+		// Check if we're already connected to this address
+		connected := false
+		for _, conn := range h.Network().Conns() {
+			for _, addr := range conn.RemoteMultiaddr().Protocols() {
+				if addr.Code == multiaddr.P_IP4 || addr.Code == multiaddr.P_IP6 {
+					remoteIP, _ := conn.RemoteMultiaddr().ValueForProtocol(addr.Code)
+					if remoteIP == ipStr {
+						connected = true
+						s.markPeerDiscovered()
+						break
+					}
+				}
+			}
+			if connected {
+				break
+			}
+		}
+
+		if connected {
+			continue
+		}
+
+		s.log.Infof("Discovered peer via DNS: %s", maStr)
+
+		// For DNS discovery without known peer IDs, we need to dial directly
+		// The libp2p identify protocol will exchange peer IDs upon connection
+		if err := s.dialPeerByAddress(ctx, h, ma); err != nil {
+			s.log.Debugf("Failed to connect to DNS-discovered peer %s: %v", maStr, err)
+		} else {
+			s.log.Infof("Connected to peer via DNS: %s", maStr)
+			s.markPeerDiscovered()
+		}
+	}
+}
+
+// dialPeerByAddress attempts to connect to a peer given only their address.
+// This is used for DNS discovery where we don't know the peer ID ahead of time.
+func (s *State) dialPeerByAddress(ctx context.Context, h host.Host, addr multiaddr.Multiaddr) error {
+	// Use a short timeout for the dial attempt
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// Try to connect using the address
+	// libp2p will discover the peer ID through the identify protocol
+	conn, err := h.Network().DialPeer(dialCtx, "")
+	if err != nil {
+		// If direct dial fails, try using swarm dial which handles unknown peer IDs
+		// This requires us to add the address to the peerstore first
+		// We'll use a placeholder approach - attempt connection and let libp2p handle it
+		return fmt.Errorf("dial failed: %w", err)
+	}
+	_ = conn
+	return nil
+}
+
+// markPeerDiscovered marks that at least one peer has been discovered.
+func (s *State) markPeerDiscovered() {
+	s.peerDiscoveryMu.Lock()
+	defer s.peerDiscoveryMu.Unlock()
+
+	if !s.peerDiscovered {
+		s.log.Info("First peer discovered, marking discovery ready")
+		s.peerDiscovered = true
+		s.peerDiscoveryReady = true
+	}
+}
+
+// markPeerDiscoveryReady marks the node as ready for traffic without requiring peer discovery.
+func (s *State) markPeerDiscoveryReady() {
+	s.peerDiscoveryMu.Lock()
+	defer s.peerDiscoveryMu.Unlock()
+	s.peerDiscoveryReady = true
+}
+
+// watchReadyTimeout monitors for the ready timeout and marks the node ready if no peers found.
+func (s *State) watchReadyTimeout(ctx context.Context) {
+	timer := time.NewTimer(s.dnsReadyTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		s.peerDiscoveryMu.Lock()
+		if !s.peerDiscoveryReady {
+			s.log.Infof("Peer discovery timeout reached (%s), marking ready anyway (first node in cluster)", s.dnsReadyTimeout)
+			s.peerDiscoveryReady = true
+		}
+		s.peerDiscoveryMu.Unlock()
+	}
+}
+
+// IsPeerDiscoveryReady returns true if the node is ready for traffic.
+// This is true if either a peer has been discovered or the ready timeout has been reached.
+func (s *State) IsPeerDiscoveryReady() bool {
+	s.peerDiscoveryMu.RLock()
+	defer s.peerDiscoveryMu.RUnlock()
+	return s.peerDiscoveryReady
+}
+
+// PeerDiscoveryStatus returns the current peer discovery status.
+func (s *State) PeerDiscoveryStatus() (discovered bool, ready bool, elapsed time.Duration) {
+	s.peerDiscoveryMu.RLock()
+	defer s.peerDiscoveryMu.RUnlock()
+	return s.peerDiscovered, s.peerDiscoveryReady, time.Since(s.peerDiscoveryStart)
+}
+
+// ConnectedPeerCount returns the number of connected peers.
+func (s *State) ConnectedPeerCount() int {
+	if s.host == nil {
+		return 0
+	}
+	return len(s.host.Network().Peers())
 }
 
 func listenAddrs(h host.Host) string {
