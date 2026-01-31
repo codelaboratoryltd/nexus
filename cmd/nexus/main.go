@@ -23,11 +23,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	rendezvous "github.com/waku-org/go-libp2p-rendezvous"
-	rvzSQLite "github.com/waku-org/go-libp2p-rendezvous/db/sqlite"
+	dbi "github.com/waku-org/go-libp2p-rendezvous/db"
 
 	"github.com/codelaboratoryltd/nexus/internal/api"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
 	"github.com/codelaboratoryltd/nexus/internal/keys"
+	"github.com/codelaboratoryltd/nexus/internal/rendezvousdb"
 	"github.com/codelaboratoryltd/nexus/internal/state"
 	"github.com/codelaboratoryltd/nexus/internal/store"
 	"github.com/codelaboratoryltd/nexus/internal/ztp"
@@ -149,6 +150,7 @@ func rootCommand() *cobra.Command {
 	// Rendezvous server command
 	var rvzPort int
 	var rvzDataPath string
+	var rvzDBBackend string
 	rendezvousCmd := &cobra.Command{
 		Use:   "rendezvous",
 		Short: "Run a libp2p rendezvous server for peer discovery",
@@ -156,11 +158,12 @@ func rootCommand() *cobra.Command {
 where mDNS doesn't work (e.g., Kubernetes). Nexus nodes can connect to this
 server to register themselves and discover other peers.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRendezvousServer(rvzPort, rvzDataPath)
+			return runRendezvousServer(rvzPort, rvzDataPath, rvzDBBackend)
 		},
 	}
 	rendezvousCmd.Flags().IntVar(&rvzPort, "port", 8765, "Rendezvous server listen port")
 	rendezvousCmd.Flags().StringVar(&rvzDataPath, "data-path", "rendezvous-data", "Data directory for rendezvous server")
+	rendezvousCmd.Flags().StringVar(&rvzDBBackend, "db-backend", "memory", "Database backend: memory (default) or badger")
 
 	// Peer ID command - prints the peer ID for a given data path
 	var peerIDDataPath string
@@ -528,13 +531,15 @@ func (m *memoryStateStore) GetMembers(ctx context.Context) map[string]*store.Nod
 }
 
 // runRendezvousServer starts a libp2p rendezvous server for peer discovery.
-func runRendezvousServer(port int, dataPath string) error {
+// dbBackend can be "memory" (default, no CGO required) or "badger" (persistent).
+func runRendezvousServer(port int, dataPath string, dbBackend string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	fmt.Printf("Starting Nexus Rendezvous Server\n")
 	fmt.Printf("  Port:     %d\n", port)
 	fmt.Printf("  Data:     %s\n", dataPath)
+	fmt.Printf("  Backend:  %s\n", dbBackend)
 
 	// Create data directory
 	if err := os.MkdirAll(dataPath, 0755); err != nil {
@@ -554,13 +559,20 @@ func runRendezvousServer(port int, dataPath string) error {
 	}
 	defer h.Close()
 
-	// Open SQLite database for rendezvous registrations
-	dbPath := dataPath + "/rendezvous.db"
-	rvzDB, err := rvzSQLite.OpenDB(ctx, dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to open rendezvous database: %w", err)
+	// Create database backend (pure Go, no CGO required)
+	var rvzDB dbi.DB
+	switch dbBackend {
+	case "badger":
+		dbPath := dataPath + "/rendezvous-badger"
+		db, err := rendezvousdb.NewBadgerDB(dbPath)
+		if err != nil {
+			return fmt.Errorf("failed to open badger database: %w", err)
+		}
+		defer db.Close()
+		rvzDB = db
+	default: // "memory"
+		rvzDB = rendezvousdb.NewMemoryDB()
 	}
-	defer rvzDB.Close()
 
 	// Create and start rendezvous service
 	_ = rendezvous.NewRendezvousService(h, rvzDB)
