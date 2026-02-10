@@ -165,7 +165,7 @@ func TestReassignerContextCancellation(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	if reassigner.IsRunning() {
-		t.Error("Reassigner should stop when context is cancelled")
+		t.Error("Reassigner should stop when context is canceled")
 	}
 }
 

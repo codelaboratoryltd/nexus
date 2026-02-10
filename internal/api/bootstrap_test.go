@@ -1103,9 +1103,10 @@ GPON33333333,paris-1`
 	activeCount := 0
 	standbyCount := 0
 	for _, d := range londonDevices {
-		if d.Role == store.DeviceRoleActive {
+		switch d.Role {
+		case store.DeviceRoleActive:
 			activeCount++
-		} else if d.Role == store.DeviceRoleStandby {
+		case store.DeviceRoleStandby:
 			standbyCount++
 		}
 	}

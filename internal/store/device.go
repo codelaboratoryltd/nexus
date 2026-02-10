@@ -161,7 +161,7 @@ func (s *deviceStore) rebuildIndexes(ctx context.Context) error {
 		}
 
 		var device Device
-		if err := json.Unmarshal(result.Entry.Value, &device); err != nil {
+		if err := json.Unmarshal(result.Value, &device); err != nil {
 			continue // Skip invalid entries
 		}
 
@@ -270,7 +270,7 @@ func (s *deviceStore) ListDevices(ctx context.Context) ([]*Device, error) {
 		}
 
 		var device Device
-		if err := json.Unmarshal(result.Entry.Value, &device); err != nil {
+		if err := json.Unmarshal(result.Value, &device); err != nil {
 			continue // Skip invalid entries
 		}
 		devices = append(devices, &device)

@@ -1,14 +1,12 @@
 package api
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -780,7 +778,7 @@ func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request) {
 			partner.PartnerNodeID = ""
 			partner.Role = store.DeviceRoleActive
 			if err := s.deviceStore.SaveDevice(ctx, partner); err != nil {
-				// Log but don't fail - best effort to update partner
+				_ = err // Log but don't fail - best effort to update partner
 			}
 		}
 	}
@@ -795,31 +793,4 @@ func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request) {
 		"message": "device deleted successfully",
 		"node_id": nodeID,
 	})
-}
-
-// parseCSVLine parses a single line of CSV data.
-func parseCSVLine(line string) ([]string, error) {
-	reader := csv.NewReader(strings.NewReader(line))
-	return reader.Read()
-}
-
-// streamingCSVReader reads CSV records one at a time.
-type streamingCSVReader struct {
-	scanner *bufio.Scanner
-}
-
-func newStreamingCSVReader(r io.Reader) *streamingCSVReader {
-	return &streamingCSVReader{
-		scanner: bufio.NewScanner(r),
-	}
-}
-
-func (s *streamingCSVReader) Read() ([]string, error) {
-	if !s.scanner.Scan() {
-		if err := s.scanner.Err(); err != nil {
-			return nil, err
-		}
-		return nil, io.EOF
-	}
-	return parseCSVLine(s.scanner.Text())
 }

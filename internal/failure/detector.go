@@ -237,7 +237,7 @@ func (d *Detector) Unsubscribe(ch chan<- NodeFailedEvent) {
 
 // Start begins the failure detection loop.
 // It returns immediately and runs the detector in a background goroutine.
-// The detector will run until Stop is called or the context is cancelled.
+// The detector will run until Stop is called or the context is canceled.
 func (d *Detector) Start(ctx context.Context) error {
 	d.mu.Lock()
 	if d.running {

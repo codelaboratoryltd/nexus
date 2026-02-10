@@ -294,10 +294,10 @@ func TestPoolToResponse_EmptyOptionalFields(t *testing.T) {
 
 	response := poolToResponse(pool)
 
-	if response.Exclusions != nil && len(response.Exclusions) != 0 {
+	if len(response.Exclusions) != 0 {
 		t.Errorf("poolToResponse Exclusions should be empty, got %v", response.Exclusions)
 	}
-	if response.Metadata != nil && len(response.Metadata) != 0 {
+	if len(response.Metadata) != 0 {
 		t.Errorf("poolToResponse Metadata should be empty, got %v", response.Metadata)
 	}
 	if response.ShardingFactor != 0 {

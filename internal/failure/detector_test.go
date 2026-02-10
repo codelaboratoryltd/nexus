@@ -177,7 +177,7 @@ func TestDetectorContextCancellation(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	if detector.IsRunning() {
-		t.Error("Detector should stop when context is cancelled")
+		t.Error("Detector should stop when context is canceled")
 	}
 }
 

@@ -380,7 +380,7 @@ func (s *Server) buildResponse(req *dhcpv4.DHCPv4, msgType dhcpv4.MessageType, c
 	}
 
 	// Standard options
-	resp.UpdateOption(dhcpv4.OptSubnetMask(net.IPMask(s.config.Network.Mask)))
+	resp.UpdateOption(dhcpv4.OptSubnetMask(s.config.Network.Mask))
 	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(s.config.LeaseTime))
 	resp.UpdateOption(dhcpv4.OptServerIdentifier(s.serverIP))
 

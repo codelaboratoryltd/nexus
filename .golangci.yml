@@ -1,0 +1,58 @@
+# golangci-lint v2 configuration for Nexus
+# https://golangci-lint.run/docs/configuration/
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # TODO: re-enable errcheck after fixing pre-existing issues
+    # - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - unconvert
+    - bodyclose
+    - gosec
+    - misspell
+  settings:
+    govet:
+      disable:
+        - shadow
+    gosec:
+      severity: medium
+      confidence: medium
+      excludes:
+        - G104  # Handled by errcheck
+        - G115  # Integer overflow — too noisy
+        - G301  # Directory permissions — system dirs need 0755
+        - G304  # File inclusion — paths validated by callers
+        - G404  # Weak RNG — non-security random
+    staticcheck:
+      checks:
+        - "all"
+        - "-SA1012"  # nil context in tests — pre-existing, fix incrementally
+        - "-ST1000"  # package comments — add incrementally
+        - "-ST1003"  # naming conventions — struct fields from external APIs
+    misspell:
+      locale: US
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 10
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true

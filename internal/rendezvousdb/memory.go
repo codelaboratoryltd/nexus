@@ -4,7 +4,6 @@
 package rendezvousdb
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"sync"
 	"time"
@@ -203,14 +202,4 @@ func (db *MemoryDB) cleanupLoop() {
 		}
 		db.mu.Unlock()
 	}
-}
-
-// generateCookieHash creates a deterministic cookie for pagination.
-func generateCookieHash(ns string, offset uint64) []byte {
-	h := sha256.New()
-	h.Write([]byte(ns))
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, offset)
-	h.Write(b)
-	return h.Sum(nil)[:8]
 }

@@ -98,10 +98,6 @@ var (
 	// Formats: london-1, site_001, datacenter-east-1, etc.
 	siteIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
 
-	// macAddressPattern matches MAC addresses in various formats
-	// Supports: 00:11:22:33:44:55, 00-11-22-33-44-55, 001122334455
-	macAddressPattern = regexp.MustCompile(`^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$|^([0-9A-Fa-f]{12})$`)
-
 	// metadataKeyPattern allows alphanumeric characters, hyphens, underscores
 	metadataKeyPattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z]$`)
 

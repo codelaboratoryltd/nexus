@@ -138,7 +138,7 @@ func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
 	if s.readinessChecker.IsPeerDiscoveryReady() {
 		peerCount := s.readinessChecker.ConnectedPeerCount()
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(fmt.Sprintf("ready (peers: %d)", peerCount)))
+		fmt.Fprintf(w, "ready (peers: %d)", peerCount)
 		return
 	}
 
