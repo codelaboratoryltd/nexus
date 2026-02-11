@@ -4,8 +4,10 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -137,10 +139,17 @@ type APIKeyValidator interface {
 	ValidateKey(ctx context.Context, key string) (*Principal, error)
 }
 
-// StaticAPIKeyValidator validates against a static list of API keys
+// hashKey returns the hex-encoded SHA-256 hash of an API key.
+func hashKey(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:])
+}
+
+// StaticAPIKeyValidator validates against a static list of API keys.
+// Keys are stored as SHA-256 hashes to avoid keeping plaintext secrets in memory.
 type StaticAPIKeyValidator struct {
 	mu   sync.RWMutex
-	keys map[string]*Principal
+	keys map[string]*Principal // keyed by SHA-256 hash of the API key
 }
 
 // NewStaticAPIKeyValidator creates a new static API key validator
@@ -150,28 +159,31 @@ func NewStaticAPIKeyValidator() *StaticAPIKeyValidator {
 	}
 }
 
-// AddKey adds an API key with associated principal
+// AddKey adds an API key with associated principal.
+// The key is hashed with SHA-256 before storage; the plaintext is not retained.
 func (v *StaticAPIKeyValidator) AddKey(key string, principal *Principal) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.keys[key] = principal
+	v.keys[hashKey(key)] = principal
 }
 
-// RemoveKey removes an API key
+// RemoveKey removes an API key.
 func (v *StaticAPIKeyValidator) RemoveKey(key string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	delete(v.keys, key)
+	delete(v.keys, hashKey(key))
 }
 
-// ValidateKey validates an API key
+// ValidateKey validates an API key by hashing the incoming key and comparing
+// the hash against stored hashes using constant-time comparison.
 func (v *StaticAPIKeyValidator) ValidateKey(ctx context.Context, key string) (*Principal, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	for storedKey, principal := range v.keys {
+	incomingHash := []byte(hashKey(key))
+	for storedHash, principal := range v.keys {
 		// Use constant-time comparison to prevent timing attacks
-		if subtle.ConstantTimeCompare([]byte(key), []byte(storedKey)) == 1 {
+		if subtle.ConstantTimeCompare(incomingHash, []byte(storedHash)) == 1 {
 			// Check if principal has expired
 			if !principal.ExpiresAt.IsZero() && time.Now().After(principal.ExpiresAt) {
 				return nil, ErrTokenExpired

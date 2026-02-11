@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -157,6 +158,36 @@ func TestStaticAPIKeyValidator(t *testing.T) {
 			t.Errorf("ValidateKey() error = %v, want ErrInvalidCredentials", err)
 		}
 	})
+}
+
+func TestStaticAPIKeyValidator_KeysAreHashed(t *testing.T) {
+	validator := NewStaticAPIKeyValidator()
+	plaintext := "secret-api-key-456"
+
+	validator.AddKey(plaintext, &Principal{
+		ID:   "hash-test",
+		Type: PrincipalTypeService,
+	})
+
+	// The internal map should not contain the plaintext key
+	validator.mu.RLock()
+	defer validator.mu.RUnlock()
+	for storedKey := range validator.keys {
+		if storedKey == plaintext {
+			t.Error("plaintext API key found in storage; expected SHA-256 hash")
+		}
+		// SHA-256 hex digest is 64 characters of hex
+		if len(storedKey) != 64 {
+			t.Errorf("stored key length = %d, want 64 (SHA-256 hex)", len(storedKey))
+		}
+		// Should be valid hex
+		for _, c := range storedKey {
+			if !strings.ContainsRune("0123456789abcdef", c) {
+				t.Errorf("stored key contains non-hex character %q", c)
+				break
+			}
+		}
+	}
 }
 
 func TestAuthenticator_APIKey(t *testing.T) {
