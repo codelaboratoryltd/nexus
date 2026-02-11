@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -10,6 +11,9 @@ import (
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
 	"github.com/codelaboratoryltd/nexus/internal/store"
 )
+
+// maxRequestBodySize is the maximum allowed request body size (1 MB).
+const maxRequestBodySize = 1 << 20
 
 // ReadinessChecker provides peer discovery status for the ready endpoint.
 type ReadinessChecker interface {
@@ -61,6 +65,20 @@ func (s *Server) SetDeviceStore(deviceStore store.DeviceStore) {
 	s.deviceStore = deviceStore
 }
 
+// maxBytesMiddleware limits request body size to prevent oversized payloads.
+func maxBytesMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isMaxBytesError returns true if the error is caused by exceeding the body size limit.
+func isMaxBytesError(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return errors.As(err, &maxBytesErr)
+}
+
 // RegisterRoutes registers all API routes on the given router.
 func (s *Server) RegisterRoutes(r *mux.Router) {
 	// Health endpoints
@@ -69,6 +87,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 
 	// API v1 endpoints
 	api := r.PathPrefix("/api/v1").Subrouter()
+	api.Use(maxBytesMiddleware)
 
 	// Pools
 	api.HandleFunc("/pools", s.listPools).Methods("GET")

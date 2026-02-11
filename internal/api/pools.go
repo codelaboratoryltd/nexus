@@ -59,6 +59,10 @@ func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 
 	var req PoolRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}
