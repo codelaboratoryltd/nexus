@@ -31,6 +31,8 @@ var (
 	ErrDangerousInput     = fmt.Errorf("potentially dangerous input detected")
 	ErrInvalidBackupRatio = fmt.Errorf("invalid backup ratio")
 	ErrInvalidNodeID      = fmt.Errorf("invalid node ID")
+	ErrInvalidGateway     = fmt.Errorf("invalid gateway address")
+	ErrInvalidDNS         = fmt.Errorf("invalid DNS server address")
 )
 
 // ValidationError provides detailed information about validation failures
@@ -449,5 +451,33 @@ func ValidateNodeID(id string) error {
 		return NewValidationError("node_id", id, "node ID contains potentially dangerous characters", err)
 	}
 
+	return nil
+}
+
+// ValidateGateway validates an optional gateway IP address.
+// An empty string is valid (means "not configured").
+func ValidateGateway(gateway string) error {
+	if gateway == "" {
+		return nil
+	}
+
+	ip := net.ParseIP(gateway)
+	if ip == nil {
+		return NewValidationError("gateway", gateway, "gateway must be a valid IPv4 or IPv6 address", ErrInvalidGateway)
+	}
+
+	return nil
+}
+
+// ValidateDNS validates an optional list of DNS server IP addresses.
+// A nil or empty slice is valid (means "not configured").
+func ValidateDNS(dns []string) error {
+	for i, server := range dns {
+		ip := net.ParseIP(server)
+		if ip == nil {
+			return NewValidationError("dns", server,
+				fmt.Sprintf("DNS server at index %d is not a valid IP address", i), ErrInvalidDNS)
+		}
+	}
 	return nil
 }

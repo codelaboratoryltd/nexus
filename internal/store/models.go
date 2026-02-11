@@ -19,6 +19,8 @@ type Pool struct {
 	Metadata       map[string]string `json:"metadata" cbor:"metadata"`
 	ShardingFactor int               `json:"sharding_factor" cbor:"sharding_factor"`
 	BackupRatio    float64           `json:"backup_ratio" cbor:"backup_ratio"` // 0.0-1.0, percentage of pool reserved for backup allocations
+	Gateway        string            `json:"gateway,omitempty" cbor:"gateway,omitempty"`
+	DNS            []string          `json:"dns,omitempty" cbor:"dns,omitempty"`
 }
 
 // Validate checks if the pool configuration is valid.
