@@ -5,12 +5,16 @@ ARG COMMIT=unknown
 
 WORKDIR /app
 
-# Copy everything including vendor directory
+# Download dependencies first (cacheable layer)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
 COPY . .
 
-# Build with version info using vendored dependencies
+# Build with version info
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -mod=vendor \
+    CGO_ENABLED=0 GOOS=linux go build \
     -ldflags "-X main.BuildVersion=${VERSION} -X main.BuildCommit=${COMMIT}" \
     -o nexus ./cmd/nexus
 
@@ -25,4 +29,3 @@ EXPOSE 9000 9001 9002 33123
 
 ENTRYPOINT ["/usr/local/bin/nexus"]
 CMD ["serve"]
-# Dockerfile modified: vendored dependencies, curl for init container
