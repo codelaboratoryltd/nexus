@@ -26,6 +26,7 @@ import (
 	dbi "github.com/waku-org/go-libp2p-rendezvous/db"
 
 	"github.com/codelaboratoryltd/nexus/internal/api"
+	"github.com/codelaboratoryltd/nexus/internal/auth"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
 	"github.com/codelaboratoryltd/nexus/internal/keys"
 	"github.com/codelaboratoryltd/nexus/internal/rendezvousdb"
@@ -69,6 +70,10 @@ type Config struct {
 	ZTPNetwork   string
 	ZTPGateway   string
 	ZTPDNS       string
+
+	// Rate limiting config
+	RateLimit      int // Max requests per minute per client
+	RateLimitBurst int // Burst size (max tokens)
 }
 
 func main() {
@@ -131,6 +136,10 @@ func rootCommand() *cobra.Command {
 	serve.Flags().StringVar(&cfg.DNSServiceName, "dns-service-name", "", "Headless service DNS name for peer discovery (e.g., nexus.namespace.svc.cluster.local)")
 	serve.Flags().DurationVar(&cfg.DNSPollInterval, "dns-poll-interval", 10*time.Second, "How often to poll DNS for peer discovery")
 	serve.Flags().DurationVar(&cfg.DNSReadyTimeout, "dns-ready-timeout", 30*time.Second, "Timeout before marking ready without peers (for first node)")
+
+	// Rate limiting flags
+	serve.Flags().IntVar(&cfg.RateLimit, "rate-limit", 100, "Maximum requests per minute per client (0 to disable)")
+	serve.Flags().IntVar(&cfg.RateLimitBurst, "rate-limit-burst", 200, "Rate limit burst size (max tokens per client)")
 
 	// ZTP DHCP server flags
 	serve.Flags().BoolVar(&cfg.ZTPEnabled, "ztp", false, "Enable ZTP DHCP server for OLT-BNG provisioning")
@@ -298,6 +307,20 @@ func runServer(cfg Config) error {
 
 	// Create HTTP router
 	router := mux.NewRouter()
+
+	// Add rate limiting middleware if enabled
+	if cfg.RateLimit > 0 {
+		rateLimiter := auth.NewRateLimiter(&auth.RateLimitConfig{
+			MaxRequests:  cfg.RateLimit,
+			Window:       time.Minute,
+			ByPrincipal:  false,
+			CleanupEvery: 5 * time.Minute,
+		})
+		defer rateLimiter.Stop()
+		router.Use(rateLimiter.Middleware())
+		fmt.Printf("  Rate limit: %d req/min (burst: %d)\n", cfg.RateLimit, cfg.RateLimitBurst)
+	}
+
 	apiServer.RegisterRoutes(router)
 
 	// Start HTTP server
