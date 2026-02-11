@@ -19,6 +19,8 @@ type PoolRequest struct {
 	Metadata       map[string]string `json:"metadata"`
 	ShardingFactor int               `json:"sharding_factor"`
 	BackupRatio    float64           `json:"backup_ratio"` // 0.0-1.0, percentage of pool reserved for backup allocations
+	Gateway        string            `json:"gateway,omitempty"`
+	DNS            []string          `json:"dns,omitempty"`
 }
 
 // PoolResponse represents a pool in API responses.
@@ -30,6 +32,8 @@ type PoolResponse struct {
 	Metadata       map[string]string `json:"metadata"`
 	ShardingFactor int               `json:"sharding_factor"`
 	BackupRatio    float64           `json:"backup_ratio"`
+	Gateway        string            `json:"gateway,omitempty"`
+	DNS            []string          `json:"dns,omitempty"`
 }
 
 // listPools returns all pools.
@@ -108,6 +112,18 @@ func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate gateway (optional)
+	if err := validation.ValidateGateway(req.Gateway); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate DNS servers (optional)
+	if err := validation.ValidateDNS(req.DNS); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	pool := &store.Pool{
 		ID:             req.ID,
 		CIDR:           *ipNet,
@@ -116,6 +132,8 @@ func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 		Metadata:       req.Metadata,
 		ShardingFactor: req.ShardingFactor,
 		BackupRatio:    req.BackupRatio,
+		Gateway:        req.Gateway,
+		DNS:            req.DNS,
 	}
 
 	if err := pool.Validate(); err != nil {
@@ -188,5 +206,7 @@ func poolToResponse(p *store.Pool) PoolResponse {
 		Metadata:       p.Metadata,
 		ShardingFactor: p.ShardingFactor,
 		BackupRatio:    p.BackupRatio,
+		Gateway:        p.Gateway,
+		DNS:            p.DNS,
 	}
 }
