@@ -94,6 +94,10 @@ func (s *Server) createAllocation(w http.ResponseWriter, r *http.Request) {
 
 	var req AllocationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}
@@ -268,6 +272,10 @@ func (s *Server) createBackupAllocations(w http.ResponseWriter, r *http.Request)
 
 	var req BackupAllocationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}
@@ -406,6 +414,10 @@ func (s *Server) renewAllocation(w http.ResponseWriter, r *http.Request) {
 
 	var req RenewAllocationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}

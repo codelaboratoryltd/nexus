@@ -107,6 +107,10 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	// Parse request body
 	var req BootstrapRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}
@@ -507,6 +511,10 @@ func (s *Server) assignDevice(w http.ResponseWriter, r *http.Request) {
 	// Parse request body
 	var req AssignDeviceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		respondError(w, http.StatusBadRequest, "invalid request body: malformed JSON")
 		return
 	}
