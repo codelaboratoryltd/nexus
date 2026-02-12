@@ -30,6 +30,7 @@ import (
 	nexusgrpc "github.com/codelaboratoryltd/nexus/internal/grpc"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
 	"github.com/codelaboratoryltd/nexus/internal/keys"
+	"github.com/codelaboratoryltd/nexus/internal/pki"
 	"github.com/codelaboratoryltd/nexus/internal/rendezvousdb"
 	"github.com/codelaboratoryltd/nexus/internal/state"
 	"github.com/codelaboratoryltd/nexus/internal/store"
@@ -89,6 +90,11 @@ type Config struct {
 
 	// Device whitelist config
 	WhitelistFile string // Path to device whitelist JSON file
+
+	// Device CA config (for issuing client certs)
+	CACert        string // Path to CA certificate for signing device certs
+	CAKey         string // Path to CA private key
+	CertValidityH int    // Default certificate validity in hours
 }
 
 func main() {
@@ -164,6 +170,11 @@ func rootCommand() *cobra.Command {
 
 	// Device whitelist flags
 	serve.Flags().StringVar(&cfg.WhitelistFile, "whitelist-file", "", "Path to device whitelist JSON file")
+
+	// Device CA flags
+	serve.Flags().StringVar(&cfg.CACert, "ca-cert", "", "Path to CA certificate for signing device certs")
+	serve.Flags().StringVar(&cfg.CAKey, "ca-key", "", "Path to CA private key for signing device certs")
+	serve.Flags().IntVar(&cfg.CertValidityH, "cert-validity", 24, "Default device certificate validity in hours")
 
 	// ZTP DHCP server flags
 	serve.Flags().BoolVar(&cfg.ZTPEnabled, "ztp", false, "Enable ZTP DHCP server for OLT-BNG provisioning")
@@ -350,6 +361,17 @@ func runServer(cfg Config) error {
 		}
 		apiServer.SetWhitelist(whitelist)
 		fmt.Printf("  Whitelist: %s\n", cfg.WhitelistFile)
+	}
+
+	// Set up device CA if configured
+	if cfg.CACert != "" && cfg.CAKey != "" {
+		validity := time.Duration(cfg.CertValidityH) * time.Hour
+		ca, err := pki.LoadCA(cfg.CACert, cfg.CAKey, validity)
+		if err != nil {
+			return fmt.Errorf("failed to load device CA: %w", err)
+		}
+		apiServer.SetCA(ca)
+		fmt.Printf("  Device CA: %s (validity: %dh)\n", cfg.CACert, cfg.CertValidityH)
 	}
 
 	// Create HTTP router
