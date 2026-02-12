@@ -1138,7 +1138,11 @@ type GracefulShutdownOptions struct {
 }
 
 // GracefulShutdown performs a graceful shutdown of the CRDT datastore.
+// It announces departure to peers, waits for acknowledgment, and updates
+// shutdown metrics accordingly.
 func (s *State) GracefulShutdown(ctx context.Context, opts *GracefulShutdownOptions) error {
+	s.log.Info("Starting graceful shutdown: announcing departure to peers")
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1156,7 +1160,19 @@ func (s *State) GracefulShutdown(ctx context.Context, opts *GracefulShutdownOpti
 	}
 
 	if err := s.store.GracefulShutdown(ctx, crdtOpts); err != nil {
+		ungracefulShutdownsTotal.Inc()
 		return fmt.Errorf("failed to perform graceful shutdown: %w", err)
+	}
+
+	gracefulShutdownsTotal.Inc()
+	s.log.Info("Graceful shutdown complete: peers acknowledged departure")
+	return nil
+}
+
+// Close shuts down the libp2p host. Call after GracefulShutdown.
+func (s *State) Close() error {
+	if s.host != nil {
+		return s.host.Close()
 	}
 	return nil
 }

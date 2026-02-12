@@ -207,6 +207,14 @@ func TestGracefulShutdownOptionsNilPeerSelector(t *testing.T) {
 	}
 }
 
+// TestClose_NilHost tests Close when host is nil (standalone mode).
+func TestClose_NilHost(t *testing.T) {
+	s := &State{}
+	if err := s.Close(); err != nil {
+		t.Errorf("Close with nil host should return nil, got %v", err)
+	}
+}
+
 // TestCRDTSyncStatus_NoPeers tests sync status with no peers tracked.
 func TestCRDTSyncStatus_NoPeers(t *testing.T) {
 	s := &State{
