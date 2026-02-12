@@ -129,6 +129,9 @@ type State struct {
 	syncMu           sync.RWMutex
 	peerLastSync     map[string]time.Time // Last successful sync time per peer
 	syncLagThreshold time.Duration        // Max acceptable lag before not-ready
+
+	// Config watch streaming
+	watchHub *WatchHub
 }
 
 // NewStateManager initializes a new State instance with P2P and CRDT.
@@ -168,6 +171,7 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 		dnsReadyTimeout:    dnsReadyTimeout,
 		peerLastSync:       make(map[string]time.Time),
 		syncLagThreshold:   syncLagThreshold,
+		watchHub:           NewWatchHub(1000),
 	}
 
 	listen, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", cfg.ListenPort))
@@ -213,9 +217,11 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 	opts.RebroadcastInterval = DefaultRebroadcastInterval
 	opts.PutHook = func(k ds.Key, v []byte) {
 		manager.enqueueWork(k, v)
+		manager.watchHub.Publish("put", k.String(), v)
 	}
 	opts.DeleteHook = func(k ds.Key) {
 		manager.enqueueWork(k, nil)
+		manager.watchHub.Publish("delete", k.String(), nil)
 	}
 	opts.NumWorkers = 50
 	opts.MultiHeadProcessing = true
@@ -834,6 +840,11 @@ func (s *State) NodeStore() store.NodeStore {
 // AllocationStore returns the allocation store.
 func (s *State) AllocationStore() store.AllocationStore {
 	return s.allocationStore
+}
+
+// WatchHub returns the change event hub for config streaming.
+func (s *State) WatchHub() *WatchHub {
+	return s.watchHub
 }
 
 // GetPool retrieves a pool by ID.
