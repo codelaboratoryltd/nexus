@@ -23,8 +23,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/discovery"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
+	mss "github.com/multiformats/go-multistream"
 	rendezvous "github.com/waku-org/go-libp2p-rendezvous"
 )
 
@@ -102,7 +107,8 @@ type State struct {
 	syncComplete    bool
 	log             *logging.ZapEventLogger
 	store           *crdt.Datastore
-	host            host.Host // libp2p host for peer connections
+	host            host.Host      // libp2p host for peer connections
+	privateKey      crypto.PrivKey // libp2p private key for probe connections
 
 	// Peer discovery status for readiness probe
 	peerDiscoveryMu    sync.RWMutex
@@ -163,6 +169,7 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 
 	manager.ourID = h.ID().String()
 	manager.host = h
+	manager.privateKey = cfg.PrivateKey
 
 	ps, err := libpubsub.NewGossipSub(ctx, h)
 	if err != nil {
@@ -532,22 +539,69 @@ func (s *State) discoverPeersViaDNS(ctx context.Context, h host.Host, serviceNam
 
 // dialPeerByAddress attempts to connect to a peer given only their address.
 // This is used for DNS discovery where we don't know the peer ID ahead of time.
+// It performs a probe connection using a raw TCP + Noise handshake to discover
+// the remote peer ID, then establishes a proper libp2p connection.
 func (s *State) dialPeerByAddress(ctx context.Context, h host.Host, addr multiaddr.Multiaddr) error {
-	// Use a short timeout for the dial attempt
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	// Try to connect using the address
-	// libp2p will discover the peer ID through the identify protocol
-	conn, err := h.Network().DialPeer(dialCtx, "")
+	// Probe: open a raw TCP connection and perform a Noise handshake to
+	// discover the remote peer ID without requiring it in advance.
+	peerID, err := s.probePeerID(dialCtx, addr)
 	if err != nil {
-		// If direct dial fails, try using swarm dial which handles unknown peer IDs
-		// This requires us to add the address to the peerstore first
-		// We'll use a placeholder approach - attempt connection and let libp2p handle it
-		return fmt.Errorf("dial failed: %w", err)
+		return fmt.Errorf("probe peer ID: %w", err)
 	}
-	_ = conn
-	return nil
+
+	// Skip if the probed peer is ourselves
+	if peerID == h.ID() {
+		return nil
+	}
+
+	// Now that we know the peer ID, add the address to the peerstore and connect properly.
+	h.Peerstore().AddAddrs(peerID, []multiaddr.Multiaddr{addr}, peerstore.TempAddrTTL)
+	return h.Connect(dialCtx, peer.AddrInfo{
+		ID:    peerID,
+		Addrs: []multiaddr.Multiaddr{addr},
+	})
+}
+
+// probePeerID dials a raw TCP connection to addr, performs multistream-select
+// and a Noise handshake with peer ID checking disabled (accepts any peer),
+// and returns the discovered remote peer ID.
+func (s *State) probePeerID(ctx context.Context, addr multiaddr.Multiaddr) (peer.ID, error) {
+	// Dial raw TCP via multiaddr
+	dialer := &manet.Dialer{}
+	conn, err := dialer.DialContext(ctx, addr)
+	if err != nil {
+		return "", fmt.Errorf("raw dial: %w", err)
+	}
+	defer conn.Close()
+
+	// Negotiate the Noise security protocol via multistream-select
+	noiseProtoID := protocol.ID(noise.ID)
+	_, err = mss.SelectOneOf([]string{string(noiseProtoID)}, conn)
+	if err != nil {
+		return "", fmt.Errorf("multistream select: %w", err)
+	}
+
+	// Create a Noise transport with peer ID checking disabled so we can
+	// discover the remote peer's identity from the handshake.
+	noiseTpt, err := noise.New(noiseProtoID, s.privateKey, nil)
+	if err != nil {
+		return "", fmt.Errorf("create noise transport: %w", err)
+	}
+	sessionTpt, err := noiseTpt.WithSessionOptions(noise.DisablePeerIDCheck())
+	if err != nil {
+		return "", fmt.Errorf("create session transport: %w", err)
+	}
+
+	secConn, err := sessionTpt.SecureOutbound(ctx, conn, "")
+	if err != nil {
+		return "", fmt.Errorf("noise handshake: %w", err)
+	}
+	defer secConn.Close()
+
+	return secConn.RemotePeer(), nil
 }
 
 // markPeerDiscovered marks that at least one peer has been discovered.
