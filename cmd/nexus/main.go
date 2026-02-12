@@ -30,6 +30,7 @@ import (
 	nexusgrpc "github.com/codelaboratoryltd/nexus/internal/grpc"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
 	"github.com/codelaboratoryltd/nexus/internal/keys"
+	"github.com/codelaboratoryltd/nexus/internal/pki"
 	"github.com/codelaboratoryltd/nexus/internal/rendezvousdb"
 	"github.com/codelaboratoryltd/nexus/internal/state"
 	"github.com/codelaboratoryltd/nexus/internal/store"
@@ -80,6 +81,20 @@ type Config struct {
 	GRPCPort    int
 	GRPCTLSCert string
 	GRPCTLSKey  string
+
+	// TLS / mTLS config
+	TLSCert       string // Path to server certificate
+	TLSKey        string // Path to server private key
+	TLSCA         string // Path to CA certificate for client verification
+	TLSClientAuth bool   // Require client certificates
+
+	// Device whitelist config
+	WhitelistFile string // Path to device whitelist JSON file
+
+	// Device CA config (for issuing client certs)
+	CACert        string // Path to CA certificate for signing device certs
+	CAKey         string // Path to CA private key
+	CertValidityH int    // Default certificate validity in hours
 }
 
 func main() {
@@ -146,6 +161,20 @@ func rootCommand() *cobra.Command {
 	// Rate limiting flags
 	serve.Flags().IntVar(&cfg.RateLimit, "rate-limit", 100, "Maximum requests per minute per client (0 to disable)")
 	serve.Flags().IntVar(&cfg.RateLimitBurst, "rate-limit-burst", 200, "Rate limit burst size (max tokens per client)")
+
+	// TLS / mTLS flags
+	serve.Flags().StringVar(&cfg.TLSCert, "tls-cert", "", "Path to server TLS certificate")
+	serve.Flags().StringVar(&cfg.TLSKey, "tls-key", "", "Path to server TLS private key")
+	serve.Flags().StringVar(&cfg.TLSCA, "tls-ca", "", "Path to CA certificate for client verification")
+	serve.Flags().BoolVar(&cfg.TLSClientAuth, "tls-client-auth", false, "Require client certificates (mTLS)")
+
+	// Device whitelist flags
+	serve.Flags().StringVar(&cfg.WhitelistFile, "whitelist-file", "", "Path to device whitelist JSON file")
+
+	// Device CA flags
+	serve.Flags().StringVar(&cfg.CACert, "ca-cert", "", "Path to CA certificate for signing device certs")
+	serve.Flags().StringVar(&cfg.CAKey, "ca-key", "", "Path to CA private key for signing device certs")
+	serve.Flags().IntVar(&cfg.CertValidityH, "cert-validity", 24, "Default device certificate validity in hours")
 
 	// ZTP DHCP server flags
 	serve.Flags().BoolVar(&cfg.ZTPEnabled, "ztp", false, "Enable ZTP DHCP server for OLT-BNG provisioning")
@@ -324,8 +353,43 @@ func runServer(cfg Config) error {
 		apiServer.SetConfigWatcher(stateManager)
 	}
 
+	// Set up device whitelist if configured
+	if cfg.WhitelistFile != "" {
+		whitelist, err := auth.NewDeviceWhitelist(cfg.WhitelistFile)
+		if err != nil {
+			return fmt.Errorf("failed to load device whitelist: %w", err)
+		}
+		apiServer.SetWhitelist(whitelist)
+		fmt.Printf("  Whitelist: %s\n", cfg.WhitelistFile)
+	}
+
+	// Set up device CA if configured
+	if cfg.CACert != "" && cfg.CAKey != "" {
+		validity := time.Duration(cfg.CertValidityH) * time.Hour
+		ca, err := pki.LoadCA(cfg.CACert, cfg.CAKey, validity)
+		if err != nil {
+			return fmt.Errorf("failed to load device CA: %w", err)
+		}
+		apiServer.SetCA(ca)
+		fmt.Printf("  Device CA: %s (validity: %dh)\n", cfg.CACert, cfg.CertValidityH)
+	}
+
 	// Create HTTP router
 	router := mux.NewRouter()
+
+	// Add mTLS middleware if TLS client auth is enabled
+	tlsConfig := &auth.TLSConfig{
+		CertFile:   cfg.TLSCert,
+		KeyFile:    cfg.TLSKey,
+		CAFile:     cfg.TLSCA,
+		ClientAuth: cfg.TLSClientAuth,
+	}
+
+	if tlsConfig.Enabled() && cfg.TLSClientAuth {
+		mtlsMiddleware := auth.NewMTLSMiddleware([]string{"/health", "/ready", "/api/v1/bootstrap"})
+		router.Use(mtlsMiddleware.Handler)
+		fmt.Println("  mTLS:     enabled (client certs required)")
+	}
 
 	// Add rate limiting middleware if enabled
 	if cfg.RateLimit > 0 {
@@ -348,6 +412,16 @@ func runServer(cfg Config) error {
 		Handler: router,
 	}
 
+	// Configure TLS if enabled
+	if tlsConfig.Enabled() {
+		serverTLS, err := tlsConfig.BuildTLSConfig()
+		if err != nil {
+			return fmt.Errorf("failed to configure TLS: %w", err)
+		}
+		httpServer.TLSConfig = serverTLS
+		fmt.Printf("  TLS:      enabled (cert: %s)\n", cfg.TLSCert)
+	}
+
 	// Start metrics server
 	metricsRouter := mux.NewRouter()
 	metricsRouter.Handle("/metrics", promhttp.Handler())
@@ -360,7 +434,13 @@ func runServer(cfg Config) error {
 	errCh := make(chan error, 3)
 
 	go func() {
-		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		var err error
+		if tlsConfig.Enabled() {
+			err = httpServer.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+		} else {
+			err = httpServer.ListenAndServe()
+		}
+		if err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("HTTP server error: %w", err)
 		}
 	}()

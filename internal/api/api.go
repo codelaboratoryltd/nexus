@@ -8,7 +8,9 @@ import (
 
 	"github.com/gorilla/mux"
 
+	"github.com/codelaboratoryltd/nexus/internal/auth"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
+	"github.com/codelaboratoryltd/nexus/internal/pki"
 	"github.com/codelaboratoryltd/nexus/internal/state"
 	"github.com/codelaboratoryltd/nexus/internal/store"
 )
@@ -33,6 +35,8 @@ type Server struct {
 	deviceStore      store.DeviceStore
 	readinessChecker ReadinessChecker
 	configWatcher    ConfigWatcher
+	whitelist        *auth.DeviceWhitelist
+	ca               *pki.CA
 }
 
 // NewServer creates a new API server.
@@ -67,6 +71,16 @@ func (s *Server) SetReadinessChecker(checker ReadinessChecker) {
 // SetDeviceStore sets the device store, enabling the bootstrap API.
 func (s *Server) SetDeviceStore(deviceStore store.DeviceStore) {
 	s.deviceStore = deviceStore
+}
+
+// SetWhitelist sets the device whitelist, enabling whitelist API endpoints.
+func (s *Server) SetWhitelist(whitelist *auth.DeviceWhitelist) {
+	s.whitelist = whitelist
+}
+
+// SetCA sets the certificate authority, enabling certificate issuance endpoints.
+func (s *Server) SetCA(ca *pki.CA) {
+	s.ca = ca
 }
 
 // maxBytesMiddleware limits request body size to prevent oversized payloads.
@@ -126,6 +140,19 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 		api.HandleFunc("/devices/{node_id}", s.getDevice).Methods("GET")
 		api.HandleFunc("/devices/{node_id}", s.assignDevice).Methods("PUT")
 		api.HandleFunc("/devices/{node_id}", s.deleteDevice).Methods("DELETE")
+	}
+
+	// Device whitelist (approval workflow)
+	if s.whitelist != nil {
+		api.HandleFunc("/devices/whitelist", s.addToWhitelist).Methods("POST")
+		api.HandleFunc("/devices/pending", s.listPendingDevices).Methods("GET")
+		api.HandleFunc("/devices/{id}/approve", s.approveDevice).Methods("POST")
+		api.HandleFunc("/devices/{id}/revoke", s.revokeDevice).Methods("POST")
+	}
+
+	// Certificate issuance (requires both whitelist and CA)
+	if s.whitelist != nil && s.ca != nil {
+		api.HandleFunc("/devices/{id}/certificate", s.issueCertificate).Methods("POST")
 	}
 }
 
