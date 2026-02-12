@@ -42,6 +42,11 @@ const (
 
 	// DefaultRebroadcastInterval is how often to rebroadcast state.
 	DefaultRebroadcastInterval = 5 * time.Second
+
+	// DefaultSyncLagThreshold is the default maximum acceptable sync lag
+	// before considering the node not ready. If the time since last successful
+	// sync with any peer exceeds this, the node reports as not ready.
+	DefaultSyncLagThreshold = 30 * time.Second
 )
 
 var (
@@ -89,6 +94,9 @@ type Config struct {
 	DNSServiceName  string        // Headless service DNS name (e.g., "nexus.namespace.svc.cluster.local")
 	DNSPollInterval time.Duration // How often to poll DNS (default: 10s)
 	DNSReadyTimeout time.Duration // Timeout for first peer discovery before marking ready anyway (default: 30s)
+
+	// CRDT sync health configuration
+	SyncLagThreshold time.Duration // Max acceptable sync lag before marking not ready (default: 30s)
 }
 
 // State manages pools, allocations, and nodes in a distributed system.
@@ -116,6 +124,11 @@ type State struct {
 	peerDiscoveryReady bool      // Ready for traffic (peer found or timeout reached)
 	peerDiscoveryStart time.Time // When discovery started
 	dnsReadyTimeout    time.Duration
+
+	// CRDT sync tracking for health endpoint
+	syncMu           sync.RWMutex
+	peerLastSync     map[string]time.Time // Last successful sync time per peer
+	syncLagThreshold time.Duration        // Max acceptable lag before not-ready
 }
 
 // NewStateManager initializes a new State instance with P2P and CRDT.
@@ -137,6 +150,11 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 		dnsReadyTimeout = 30 * time.Second
 	}
 
+	syncLagThreshold := cfg.SyncLagThreshold
+	if syncLagThreshold == 0 {
+		syncLagThreshold = DefaultSyncLagThreshold
+	}
+
 	manager := &State{
 		poolStore:          nil,
 		allocationStore:    nil,
@@ -148,6 +166,8 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 		log:                log,
 		peerDiscoveryStart: time.Now(),
 		dnsReadyTimeout:    dnsReadyTimeout,
+		peerLastSync:       make(map[string]time.Time),
+		syncLagThreshold:   syncLagThreshold,
 	}
 
 	listen, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", cfg.ListenPort))
@@ -649,6 +669,65 @@ func (s *State) IsPeerDiscoveryReady() bool {
 	return s.peerDiscoveryReady
 }
 
+// CRDTSyncStatus represents the current CRDT sync health.
+type CRDTSyncStatus struct {
+	PeersConnected int       // Number of peers with sync data
+	SyncLagMs      int64     // Max sync lag across all peers in milliseconds
+	LastSync       time.Time // Most recent sync time across all peers
+}
+
+// CRDTSyncStatus returns the current CRDT sync health status.
+// The sync lag is the maximum time since last successful sync across all peers.
+func (s *State) CRDTSyncStatus() CRDTSyncStatus {
+	s.syncMu.RLock()
+	defer s.syncMu.RUnlock()
+
+	status := CRDTSyncStatus{
+		PeersConnected: len(s.peerLastSync),
+	}
+
+	if len(s.peerLastSync) == 0 {
+		return status
+	}
+
+	now := time.Now()
+	var maxLag time.Duration
+	var latest time.Time
+
+	for _, lastSync := range s.peerLastSync {
+		lag := now.Sub(lastSync)
+		if lag > maxLag {
+			maxLag = lag
+		}
+		if lastSync.After(latest) {
+			latest = lastSync
+		}
+	}
+
+	status.SyncLagMs = maxLag.Milliseconds()
+	status.LastSync = latest
+	return status
+}
+
+// IsCRDTSyncHealthy returns true if the CRDT sync lag is within threshold.
+// If there are no peers, this returns true (standalone/first node).
+func (s *State) IsCRDTSyncHealthy() bool {
+	s.syncMu.RLock()
+	defer s.syncMu.RUnlock()
+
+	if len(s.peerLastSync) == 0 {
+		return true
+	}
+
+	now := time.Now()
+	for _, lastSync := range s.peerLastSync {
+		if now.Sub(lastSync) > s.syncLagThreshold {
+			return false
+		}
+	}
+	return true
+}
+
 // PeerDiscoveryStatus returns the current peer discovery status.
 func (s *State) PeerDiscoveryStatus() (discovered bool, ready bool, elapsed time.Duration) {
 	s.peerDiscoveryMu.RLock()
@@ -898,6 +977,8 @@ func (s *State) handleMembershipUpdate(members map[string]*pb.Participant) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
+
 	nexusNodes := make(map[string]nodeInfo)
 	for id, participant := range members {
 		// Filter nexus members for hashring
@@ -908,6 +989,33 @@ func (s *State) handleMembershipUpdate(members map[string]*pb.Participant) {
 			}
 		}
 	}
+
+	// Record sync time for all peers (excluding ourselves)
+	s.syncMu.Lock()
+	for id := range nexusNodes {
+		if id != s.ourID {
+			s.peerLastSync[id] = now
+		}
+	}
+	// Remove stale peer entries
+	for id := range s.peerLastSync {
+		if _, exists := nexusNodes[id]; !exists {
+			delete(s.peerLastSync, id)
+		}
+	}
+	peerCount := len(s.peerLastSync)
+	var maxLag float64
+	for _, lastSync := range s.peerLastSync {
+		lag := now.Sub(lastSync).Seconds()
+		if lag > maxLag {
+			maxLag = lag
+		}
+	}
+	s.syncMu.Unlock()
+
+	// Update Prometheus metrics
+	crdtPeersConnectedGauge.Set(float64(peerCount))
+	crdtSyncLagGauge.Set(maxLag)
 
 	// Add new nodes or update existing ones.
 	for id, info := range nexusNodes {

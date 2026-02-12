@@ -3,22 +3,25 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/mux"
 
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
+	"github.com/codelaboratoryltd/nexus/internal/state"
 	"github.com/codelaboratoryltd/nexus/internal/store"
 )
 
 // maxRequestBodySize is the maximum allowed request body size (1 MB).
 const maxRequestBodySize = 1 << 20
 
-// ReadinessChecker provides peer discovery status for the ready endpoint.
+// ReadinessChecker provides peer discovery and CRDT sync status for the ready endpoint.
 type ReadinessChecker interface {
 	IsPeerDiscoveryReady() bool
 	ConnectedPeerCount() int
+	CRDTSyncStatus() state.CRDTSyncStatus
+	IsCRDTSyncHealthy() bool
 }
 
 // Server provides the HTTP API for Nexus.
@@ -142,26 +145,50 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// readyResponse is the JSON response for the /ready endpoint.
+type readyResponse struct {
+	Ready    bool              `json:"ready"`
+	CRDTSync *crdtSyncResponse `json:"crdt_sync,omitempty"`
+}
+
+// crdtSyncResponse represents the CRDT sync status in the ready response.
+type crdtSyncResponse struct {
+	PeersConnected int    `json:"peers_connected"`
+	SyncLagMs      int64  `json:"sync_lag_ms"`
+	LastSync       string `json:"last_sync"`
+}
+
 // readyHandler returns readiness status.
 // If a readiness checker is configured (P2P mode with DNS discovery),
 // this will return 503 until peer discovery is ready.
 func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
 	// If no readiness checker is configured, always return ready (standalone mode)
 	if s.readinessChecker == nil {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ready"))
+		respondJSON(w, http.StatusOK, readyResponse{Ready: true})
 		return
 	}
 
-	// Check peer discovery status
-	if s.readinessChecker.IsPeerDiscoveryReady() {
-		peerCount := s.readinessChecker.ConnectedPeerCount()
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "ready (peers: %d)", peerCount)
-		return
+	discoveryReady := s.readinessChecker.IsPeerDiscoveryReady()
+	syncHealthy := s.readinessChecker.IsCRDTSyncHealthy()
+	syncStatus := s.readinessChecker.CRDTSyncStatus()
+
+	ready := discoveryReady && syncHealthy
+
+	resp := readyResponse{
+		Ready: ready,
+		CRDTSync: &crdtSyncResponse{
+			PeersConnected: syncStatus.PeersConnected,
+			SyncLagMs:      syncStatus.SyncLagMs,
+		},
 	}
 
-	// Not ready yet - waiting for peer discovery
-	w.WriteHeader(http.StatusServiceUnavailable)
-	w.Write([]byte("waiting for peer discovery"))
+	if !syncStatus.LastSync.IsZero() {
+		resp.CRDTSync.LastSync = syncStatus.LastSync.Format(time.RFC3339)
+	}
+
+	if ready {
+		respondJSON(w, http.StatusOK, resp)
+	} else {
+		respondJSON(w, http.StatusServiceUnavailable, resp)
+	}
 }
