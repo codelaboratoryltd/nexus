@@ -305,6 +305,11 @@ func runServer(cfg Config) error {
 		apiServer.SetReadinessChecker(stateManager)
 	}
 
+	// Enable config watch streaming in P2P mode
+	if stateManager != nil {
+		apiServer.SetConfigWatcher(stateManager)
+	}
+
 	// Create HTTP router
 	router := mux.NewRouter()
 
@@ -425,8 +430,33 @@ func runServer(cfg Config) error {
 	case <-ctx.Done():
 	}
 
-	// Graceful shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Graceful shutdown with peer acknowledgment (P2P mode)
+	if stateManager != nil {
+		fmt.Println("Performing graceful shutdown with peer acknowledgment...")
+		shutdownOpts := &state.GracefulShutdownOptions{
+			MaxWaitTime:   10 * time.Second,
+			GracePeriod:   2 * time.Second,
+			CheckInterval: 500 * time.Millisecond,
+			PeerSelector: func(metadata map[string]string) bool {
+				// Only wait for acknowledgment from Nexus write nodes
+				return metadata["name"] == "Nexus" && metadata["role"] != "read"
+			},
+			RequiredMatches: 1,
+		}
+
+		gracefulCtx, gracefulCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := stateManager.GracefulShutdown(gracefulCtx, shutdownOpts); err != nil {
+			fmt.Printf("Graceful shutdown failed (proceeding anyway): %v\n", err)
+		}
+		gracefulCancel()
+
+		if err := stateManager.Close(); err != nil {
+			fmt.Printf("Failed to close P2P host: %v\n", err)
+		}
+	}
+
+	// Shutdown HTTP servers
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
 	httpServer.Shutdown(shutdownCtx)

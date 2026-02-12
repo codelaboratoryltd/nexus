@@ -21,4 +21,18 @@ var (
 		Name:      "peers_connected",
 		Help:      "Number of peers with CRDT sync data.",
 	})
+
+	// gracefulShutdownsTotal counts the number of graceful shutdowns completed.
+	gracefulShutdownsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "nexus",
+		Name:      "graceful_shutdowns_total",
+		Help:      "Total number of graceful shutdowns completed.",
+	})
+
+	// ungracefulShutdownsTotal counts the number of ungraceful (failed/timed-out) shutdowns.
+	ungracefulShutdownsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "nexus",
+		Name:      "ungraceful_shutdowns_total",
+		Help:      "Total number of ungraceful (failed or timed-out) shutdowns.",
+	})
 )

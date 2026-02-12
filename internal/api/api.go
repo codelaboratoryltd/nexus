@@ -32,6 +32,7 @@ type Server struct {
 	allocStore       store.AllocationStore
 	deviceStore      store.DeviceStore
 	readinessChecker ReadinessChecker
+	configWatcher    ConfigWatcher
 }
 
 // NewServer creates a new API server.
@@ -113,6 +114,9 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 
 	// Backup Allocations
 	api.HandleFunc("/pools/{pool_id}/backup-allocations", s.createBackupAllocations).Methods("POST")
+
+	// Config watch streaming (SSE)
+	api.HandleFunc("/watch", s.watchHandler).Methods("GET")
 
 	// Bootstrap (device registration)
 	if s.deviceStore != nil {

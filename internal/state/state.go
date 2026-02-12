@@ -129,6 +129,9 @@ type State struct {
 	syncMu           sync.RWMutex
 	peerLastSync     map[string]time.Time // Last successful sync time per peer
 	syncLagThreshold time.Duration        // Max acceptable lag before not-ready
+
+	// Config watch streaming
+	watchHub *WatchHub
 }
 
 // NewStateManager initializes a new State instance with P2P and CRDT.
@@ -168,6 +171,7 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 		dnsReadyTimeout:    dnsReadyTimeout,
 		peerLastSync:       make(map[string]time.Time),
 		syncLagThreshold:   syncLagThreshold,
+		watchHub:           NewWatchHub(1000),
 	}
 
 	listen, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", cfg.ListenPort))
@@ -213,9 +217,11 @@ func NewStateManager(ctx context.Context, cfg Config) (*State, error) {
 	opts.RebroadcastInterval = DefaultRebroadcastInterval
 	opts.PutHook = func(k ds.Key, v []byte) {
 		manager.enqueueWork(k, v)
+		manager.watchHub.Publish("put", k.String(), v)
 	}
 	opts.DeleteHook = func(k ds.Key) {
 		manager.enqueueWork(k, nil)
+		manager.watchHub.Publish("delete", k.String(), nil)
 	}
 	opts.NumWorkers = 50
 	opts.MultiHeadProcessing = true
@@ -836,6 +842,11 @@ func (s *State) AllocationStore() store.AllocationStore {
 	return s.allocationStore
 }
 
+// WatchHub returns the change event hub for config streaming.
+func (s *State) WatchHub() *WatchHub {
+	return s.watchHub
+}
+
 // GetPool retrieves a pool by ID.
 func (s *State) GetPool(ctx context.Context, id string) (*store.Pool, error) {
 	pool, err := s.poolStore.GetPool(ctx, id)
@@ -1138,7 +1149,11 @@ type GracefulShutdownOptions struct {
 }
 
 // GracefulShutdown performs a graceful shutdown of the CRDT datastore.
+// It announces departure to peers, waits for acknowledgment, and updates
+// shutdown metrics accordingly.
 func (s *State) GracefulShutdown(ctx context.Context, opts *GracefulShutdownOptions) error {
+	s.log.Info("Starting graceful shutdown: announcing departure to peers")
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1156,7 +1171,19 @@ func (s *State) GracefulShutdown(ctx context.Context, opts *GracefulShutdownOpti
 	}
 
 	if err := s.store.GracefulShutdown(ctx, crdtOpts); err != nil {
+		ungracefulShutdownsTotal.Inc()
 		return fmt.Errorf("failed to perform graceful shutdown: %w", err)
+	}
+
+	gracefulShutdownsTotal.Inc()
+	s.log.Info("Graceful shutdown complete: peers acknowledged departure")
+	return nil
+}
+
+// Close shuts down the libp2p host. Call after GracefulShutdown.
+func (s *State) Close() error {
+	if s.host != nil {
+		return s.host.Close()
 	}
 	return nil
 }
