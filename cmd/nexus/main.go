@@ -27,6 +27,7 @@ import (
 
 	"github.com/codelaboratoryltd/nexus/internal/api"
 	"github.com/codelaboratoryltd/nexus/internal/auth"
+	nexusgrpc "github.com/codelaboratoryltd/nexus/internal/grpc"
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
 	"github.com/codelaboratoryltd/nexus/internal/keys"
 	"github.com/codelaboratoryltd/nexus/internal/rendezvousdb"
@@ -74,6 +75,11 @@ type Config struct {
 	// Rate limiting config
 	RateLimit      int // Max requests per minute per client
 	RateLimitBurst int // Burst size (max tokens)
+
+	// gRPC config
+	GRPCPort    int
+	GRPCTLSCert string
+	GRPCTLSKey  string
 }
 
 func main() {
@@ -148,6 +154,11 @@ func rootCommand() *cobra.Command {
 	serve.Flags().StringVar(&cfg.ZTPGateway, "ztp-gateway", "", "Gateway IP for management network (defaults to first IP)")
 	serve.Flags().StringVar(&cfg.ZTPDNS, "ztp-dns", "8.8.8.8,8.8.4.4", "DNS servers (comma-separated)")
 
+	// gRPC server flags
+	serve.Flags().IntVar(&cfg.GRPCPort, "grpc-port", 9090, "gRPC API port (0 to disable)")
+	serve.Flags().StringVar(&cfg.GRPCTLSCert, "grpc-tls-cert", "", "TLS certificate file for gRPC server")
+	serve.Flags().StringVar(&cfg.GRPCTLSKey, "grpc-tls-key", "", "TLS key file for gRPC server")
+
 	version := &cobra.Command{
 		Use:   "version",
 		Short: "Print version information",
@@ -217,6 +228,9 @@ func runServer(cfg Config) error {
 	}
 	if cfg.DNSServiceName != "" {
 		fmt.Printf("  DNS Service: %s (poll: %s, timeout: %s)\n", cfg.DNSServiceName, cfg.DNSPollInterval, cfg.DNSReadyTimeout)
+	}
+	if cfg.GRPCPort > 0 {
+		fmt.Printf("  gRPC:     localhost:%d\n", cfg.GRPCPort)
 	}
 	fmt.Printf("  ZTP:      %v\n", cfg.ZTPEnabled)
 
@@ -338,7 +352,7 @@ func runServer(cfg Config) error {
 	}
 
 	// Start servers in goroutines
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
@@ -351,6 +365,27 @@ func runServer(cfg Config) error {
 			errCh <- fmt.Errorf("metrics server error: %w", err)
 		}
 	}()
+
+	// Start gRPC server if enabled
+	var grpcServer *nexusgrpc.Server
+	if cfg.GRPCPort > 0 {
+		grpcCfg := nexusgrpc.ServerConfig{
+			Port:    cfg.GRPCPort,
+			TLSCert: cfg.GRPCTLSCert,
+			TLSKey:  cfg.GRPCTLSKey,
+		}
+		var err error
+		grpcServer, err = nexusgrpc.NewServer(grpcCfg, ring, poolStore, nodeStore, allocStore)
+		if err != nil {
+			return fmt.Errorf("failed to create gRPC server: %w", err)
+		}
+
+		go func() {
+			if err := grpcServer.Serve(); err != nil {
+				errCh <- fmt.Errorf("gRPC server error: %w", err)
+			}
+		}()
+	}
 
 	// Start ZTP DHCP server if enabled
 	var ztpServer *ztp.Server
@@ -431,6 +466,10 @@ func runServer(cfg Config) error {
 
 	httpServer.Shutdown(shutdownCtx)
 	metricsServer.Shutdown(shutdownCtx)
+
+	if grpcServer != nil {
+		grpcServer.GracefulStop()
+	}
 
 	if ztpServer != nil {
 		ztpServer.Stop()
