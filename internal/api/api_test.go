@@ -15,8 +15,22 @@ import (
 
 	"github.com/codelaboratoryltd/nexus/internal/hashring"
 	"github.com/codelaboratoryltd/nexus/internal/resource"
+	"github.com/codelaboratoryltd/nexus/internal/state"
 	"github.com/codelaboratoryltd/nexus/internal/store"
 )
+
+// mockReadinessChecker implements ReadinessChecker for testing.
+type mockReadinessChecker struct {
+	peerDiscoveryReady bool
+	connectedPeers     int
+	syncStatus         state.CRDTSyncStatus
+	syncHealthy        bool
+}
+
+func (m *mockReadinessChecker) IsPeerDiscoveryReady() bool           { return m.peerDiscoveryReady }
+func (m *mockReadinessChecker) ConnectedPeerCount() int              { return m.connectedPeers }
+func (m *mockReadinessChecker) CRDTSyncStatus() state.CRDTSyncStatus { return m.syncStatus }
+func (m *mockReadinessChecker) IsCRDTSyncHealthy() bool              { return m.syncHealthy }
 
 // Mock implementations for testing
 
@@ -314,7 +328,7 @@ func TestHealthHandler(t *testing.T) {
 	}
 }
 
-func TestReadyHandler(t *testing.T) {
+func TestReadyHandler_Standalone(t *testing.T) {
 	server, _, _, _ := setupTestServer()
 	router := setupTestRouter(server)
 
@@ -326,8 +340,127 @@ func TestReadyHandler(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("ready handler returned status %d, want %d", w.Code, http.StatusOK)
 	}
-	if w.Body.String() != "ready" {
-		t.Errorf("ready handler returned body %q, want %q", w.Body.String(), "ready")
+
+	var resp readyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if !resp.Ready {
+		t.Error("ready handler returned ready=false, want true")
+	}
+	if resp.CRDTSync != nil {
+		t.Error("ready handler returned crdt_sync in standalone mode, want nil")
+	}
+}
+
+func TestReadyHandler_WithChecker_Ready(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+
+	checker := &mockReadinessChecker{
+		peerDiscoveryReady: true,
+		connectedPeers:     2,
+		syncHealthy:        true,
+		syncStatus: state.CRDTSyncStatus{
+			PeersConnected: 2,
+			SyncLagMs:      150,
+			LastSync:       time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	server.SetReadinessChecker(checker)
+
+	router := setupTestRouter(server)
+	req := httptest.NewRequest("GET", "/ready", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("ready handler returned status %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var resp readyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if !resp.Ready {
+		t.Error("ready handler returned ready=false, want true")
+	}
+	if resp.CRDTSync == nil {
+		t.Fatal("ready handler returned nil crdt_sync, want non-nil")
+	}
+	if resp.CRDTSync.PeersConnected != 2 {
+		t.Errorf("peers_connected = %d, want 2", resp.CRDTSync.PeersConnected)
+	}
+	if resp.CRDTSync.SyncLagMs != 150 {
+		t.Errorf("sync_lag_ms = %d, want 150", resp.CRDTSync.SyncLagMs)
+	}
+	if resp.CRDTSync.LastSync != "2024-01-01T00:00:00Z" {
+		t.Errorf("last_sync = %s, want 2024-01-01T00:00:00Z", resp.CRDTSync.LastSync)
+	}
+}
+
+func TestReadyHandler_NotReady_Discovery(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+
+	checker := &mockReadinessChecker{
+		peerDiscoveryReady: false,
+		syncHealthy:        true,
+	}
+	server.SetReadinessChecker(checker)
+
+	router := setupTestRouter(server)
+	req := httptest.NewRequest("GET", "/ready", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("ready handler returned status %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+
+	var resp readyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if resp.Ready {
+		t.Error("ready handler returned ready=true, want false")
+	}
+}
+
+func TestReadyHandler_NotReady_SyncLag(t *testing.T) {
+	server, _, _, _ := setupTestServer()
+
+	checker := &mockReadinessChecker{
+		peerDiscoveryReady: true,
+		connectedPeers:     2,
+		syncHealthy:        false,
+		syncStatus: state.CRDTSyncStatus{
+			PeersConnected: 2,
+			SyncLagMs:      45000,
+			LastSync:       time.Now().Add(-45 * time.Second),
+		},
+	}
+	server.SetReadinessChecker(checker)
+
+	router := setupTestRouter(server)
+	req := httptest.NewRequest("GET", "/ready", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("ready handler returned status %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+
+	var resp readyResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if resp.Ready {
+		t.Error("ready handler returned ready=true, want false")
+	}
+	if resp.CRDTSync.SyncLagMs != 45000 {
+		t.Errorf("sync_lag_ms = %d, want 45000", resp.CRDTSync.SyncLagMs)
 	}
 }
 
@@ -990,7 +1123,7 @@ func TestRegisterRoutes(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("ready endpoint not registered properly, got status %d", w.Code)
+		t.Errorf("ready endpoint not registered properly, got status %d: %s", w.Code, w.Body.String())
 	}
 }
 
