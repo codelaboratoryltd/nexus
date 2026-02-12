@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -450,10 +451,8 @@ func (s *Server) listExpiringAllocations(w http.ResponseWriter, r *http.Request)
 		withinStr = "3600" // Default to 1 hour
 	}
 
-	var withinSeconds int64
-	if _, err := json.Number(withinStr).Int64(); err == nil {
-		withinSeconds, _ = json.Number(withinStr).Int64()
-	} else {
+	withinSeconds, err := strconv.ParseInt(withinStr, 10, 64)
+	if err != nil {
 		respondError(w, http.StatusBadRequest, "invalid 'within' parameter: must be seconds")
 		return
 	}
