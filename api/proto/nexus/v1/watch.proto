@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package nexus.v1;
+
+option go_package = "github.com/codelaboratoryltd/nexus/api/proto/nexus/v1;nexusv1";
+
+import "google/protobuf/timestamp.proto";
+
+// WatchService provides server-streaming of configuration changes.
+service WatchService {
+  // Watch streams configuration changes (pools, allocations) to clients.
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+}
+
+message WatchRequest {
+  // Filter events by resource type. Empty means all types.
+  repeated string resource_types = 1;
+  // Filter events by pool ID. Empty means all pools.
+  string pool_id = 2;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_POOL_CREATED = 1;
+  EVENT_TYPE_POOL_DELETED = 2;
+  EVENT_TYPE_ALLOCATION_CREATED = 3;
+  EVENT_TYPE_ALLOCATION_RELEASED = 4;
+  EVENT_TYPE_NODE_REGISTERED = 5;
+  EVENT_TYPE_NODE_EXPIRED = 6;
+}
+
+message WatchEvent {
+  EventType type = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  // The resource ID affected (pool ID, subscriber ID, or node ID).
+  string resource_id = 3;
+  // Optional payload depending on event type.
+  oneof payload {
+    PoolEvent pool = 4;
+    AllocationEvent allocation = 5;
+    NodeEvent node = 6;
+  }
+}
+
+message PoolEvent {
+  string id = 1;
+  string cidr = 2;
+}
+
+message AllocationEvent {
+  string pool_id = 1;
+  string subscriber_id = 2;
+  string ip = 3;
+  string node_id = 4;
+}
+
+message NodeEvent {
+  string id = 1;
+  map<string, string> metadata = 2;
+}

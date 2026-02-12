@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package nexus.v1;
+
+option go_package = "github.com/codelaboratoryltd/nexus/api/proto/nexus/v1;nexusv1";
+
+// PoolService provides operations for IP address pool management.
+service PoolService {
+  // CreatePool creates a new IP address pool.
+  rpc CreatePool(CreatePoolRequest) returns (CreatePoolResponse);
+
+  // GetPool returns a specific pool by ID.
+  rpc GetPool(GetPoolRequest) returns (GetPoolResponse);
+
+  // ListPools returns all pools.
+  rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse);
+
+  // DeletePool removes a pool.
+  rpc DeletePool(DeletePoolRequest) returns (DeletePoolResponse);
+}
+
+message Pool {
+  string id = 1;
+  string cidr = 2;
+  int32 prefix = 3;
+  repeated string exclusions = 4;
+  map<string, string> metadata = 5;
+  int32 sharding_factor = 6;
+  double backup_ratio = 7;
+  string gateway = 8;
+  repeated string dns = 9;
+}
+
+message CreatePoolRequest {
+  string id = 1;
+  string cidr = 2;
+  int32 prefix = 3;
+  repeated string exclusions = 4;
+  map<string, string> metadata = 5;
+  int32 sharding_factor = 6;
+  double backup_ratio = 7;
+  string gateway = 8;
+  repeated string dns = 9;
+}
+
+message CreatePoolResponse {
+  Pool pool = 1;
+}
+
+message GetPoolRequest {
+  string id = 1;
+}
+
+message GetPoolResponse {
+  Pool pool = 1;
+}
+
+message ListPoolsRequest {}
+
+message ListPoolsResponse {
+  repeated Pool pools = 1;
+  int32 count = 2;
+}
+
+message DeletePoolRequest {
+  string id = 1;
+}
+
+message DeletePoolResponse {}
