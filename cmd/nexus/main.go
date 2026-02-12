@@ -305,6 +305,11 @@ func runServer(cfg Config) error {
 		apiServer.SetReadinessChecker(stateManager)
 	}
 
+	// Enable config watch streaming in P2P mode
+	if stateManager != nil {
+		apiServer.SetConfigWatcher(stateManager)
+	}
+
 	// Create HTTP router
 	router := mux.NewRouter()
 
