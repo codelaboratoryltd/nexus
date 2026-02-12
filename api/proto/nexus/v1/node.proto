@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package nexus.v1;
+
+option go_package = "github.com/codelaboratoryltd/nexus/api/proto/nexus/v1;nexusv1";
+
+import "google/protobuf/timestamp.proto";
+
+// NodeService provides operations for cluster node management.
+service NodeService {
+  // Register registers a node with the cluster or updates its heartbeat.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Heartbeat sends a heartbeat from a node to keep it active.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // ListNodes returns all nodes in the cluster.
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+
+message Node {
+  string id = 1;
+  google.protobuf.Timestamp best_before = 2;
+  map<string, string> metadata = 3;
+  string status = 4;
+}
+
+message RegisterRequest {
+  string node_id = 1;
+  map<string, string> metadata = 2;
+  // TTL in seconds for the node's best-before time.
+  int64 ttl_seconds = 3;
+}
+
+message RegisterResponse {
+  Node node = 1;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  // TTL in seconds to extend the node's best-before time.
+  int64 ttl_seconds = 2;
+}
+
+message HeartbeatResponse {
+  Node node = 1;
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+  int32 count = 2;
+}

@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package nexus.v1;
+
+option go_package = "github.com/codelaboratoryltd/nexus/api/proto/nexus/v1;nexusv1";
+
+import "google/protobuf/timestamp.proto";
+
+// AllocationService provides operations for IP allocation management.
+service AllocationService {
+  // Allocate creates a new IP allocation for a subscriber.
+  rpc Allocate(AllocateRequest) returns (AllocateResponse);
+
+  // Release removes a subscriber's IP allocation.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+
+  // Get returns a subscriber's current allocation.
+  rpc Get(GetAllocationRequest) returns (GetAllocationResponse);
+
+  // List returns allocations, filtered by pool ID.
+  rpc List(ListAllocationsRequest) returns (ListAllocationsResponse);
+}
+
+message Allocation {
+  string pool_id = 1;
+  string subscriber_id = 2;
+  string ip = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  string node_id = 5;
+  string backup_node_id = 6;
+  bool is_backup = 7;
+  int64 ttl = 8;
+  uint64 epoch = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  google.protobuf.Timestamp last_renewed = 11;
+  string alloc_type = 12;
+}
+
+message AllocateRequest {
+  string pool_id = 1;
+  string subscriber_id = 2;
+  // Optional: specify IP or let the system allocate from the pool.
+  string ip = 3;
+  // Optional: primary node that owns this allocation.
+  string node_id = 4;
+  // Optional: TTL in seconds (0 = permanent).
+  int64 ttl = 5;
+  // Optional: "session", "sticky", "permanent".
+  string alloc_type = 6;
+}
+
+message AllocateResponse {
+  Allocation allocation = 1;
+}
+
+message ReleaseRequest {
+  string subscriber_id = 1;
+  // Optional: pool ID. If empty, looked up from subscriber's allocation.
+  string pool_id = 2;
+}
+
+message ReleaseResponse {}
+
+message GetAllocationRequest {
+  string subscriber_id = 1;
+}
+
+message GetAllocationResponse {
+  Allocation allocation = 1;
+}
+
+message ListAllocationsRequest {
+  string pool_id = 1;
+}
+
+message ListAllocationsResponse {
+  repeated Allocation allocations = 1;
+  int32 count = 2;
+}
